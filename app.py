@@ -7,6 +7,7 @@ Indeed postings via Wire. Built for Anakin Blitz.
 import streamlit as st
 from wire_client import search_jobs, WireError
 from analyzer import analyze_gap
+from location_normalizer import suggestions
 
 st.set_page_config(page_title="GapCheck", page_icon=":dart:", layout="centered")
 
@@ -135,6 +136,14 @@ div[data-testid="stForm"] label { color: #C9C6C0 !important; font-size: 0.88rem 
 .gc-job-company a { color: #FF9A6B; text-decoration: none; font-weight: 500; }
 .gc-job-company a:hover { text-decoration: underline; }
 
+.gc-resolved-location {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: #7C7973;
+    margin-top: 0.4rem;
+}
+.gc-resolved-location b { color: #9FDDB4; }
+
 div[data-testid="stExpander"] {
     background: #181A1F;
     border: 1px solid #262A31;
@@ -174,7 +183,11 @@ with st.form("gap_form"):
     with col1:
         target_role = st.text_input("Target role", placeholder="e.g. Backend Developer")
     with col2:
-        location = st.text_input("Location", value="Bengaluru, Karnataka")
+        location = st.text_input(
+            "Location",
+            placeholder="Example: Bengaluru, India / NYC / London / Vijayawada",
+            help="Type any city, anywhere — we'll normalize it automatically.",
+        )
     submitted = st.form_submit_button("Run Gap Check", use_container_width=True)
 
 if submitted:
@@ -184,11 +197,23 @@ if submitted:
 
     try:
         with st.status("Searching live Indeed postings via Wire...", expanded=False) as status:
-            jobs, live = search_jobs(target_role, location=location or "Bengaluru, Karnataka")
+            jobs, live, resolved_location = search_jobs(target_role, location=location)
             status.update(label="Found " + str(len(jobs)) + " live postings via Wire")
 
+        st.markdown(
+            '<div class="gc-resolved-location">Searched as: <b>' + resolved_location + '</b></div>',
+            unsafe_allow_html=True,
+        )
+
         if not jobs:
-            st.warning("No live postings found for that role/location. Try a broader role title.")
+            st.warning(
+                "No live postings found for **" + target_role + "** in **" + resolved_location + "**.\n\n"
+                "Try one of these known-good locations, or a broader role title:"
+            )
+            st.markdown(
+                "".join('<span class="gc-pill">' + s + '</span>' for s in suggestions()),
+                unsafe_allow_html=True,
+            )
             st.stop()
 
         with st.status("Analyzing your gap against real postings...", expanded=False) as status:

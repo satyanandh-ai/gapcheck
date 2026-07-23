@@ -15,6 +15,8 @@ import json
 import requests
 from dotenv import load_dotenv
 
+from location_normalizer import normalize_location, simplified_fallback
+
 load_dotenv()
 
 WIRE_API_KEY = os.getenv("WIRE_API_KEY")
@@ -29,6 +31,31 @@ def _headers():
     if not WIRE_API_KEY:
         raise WireError("WIRE_API_KEY not set — add it to your .env file")
     return {"X-API-Key": WIRE_API_KEY}
+
+
+def _extract_failure_reason(polled: dict) -> str:
+    """
+    Wire doesn't consistently put the failure reason in the same spot.
+    Check the likely locations in order, and fall back to dumping the
+    raw payload rather than silently returning None.
+    """
+    candidates = [
+        polled.get("data", {}).get("error") if isinstance(polled.get("data"), dict) else None,
+        polled.get("data", {}).get("message") if isinstance(polled.get("data"), dict) else None,
+        polled.get("data", {}).get("data", {}).get("error")
+        if isinstance(polled.get("data"), dict) and isinstance(polled.get("data", {}).get("data"), dict)
+        else None,
+        polled.get("error"),
+        polled.get("message"),
+        polled.get("reason"),
+    ]
+    for c in candidates:
+        if c:
+            return str(c)
+
+    # Nothing usable found in the expected fields — surface the whole
+    # payload so it's debuggable instead of printing "None".
+    return f"no reason provided by Wire (raw response: {json.dumps(polled)[:500]})"
 
 
 def get_catalog(service: str):
@@ -66,7 +93,7 @@ def run_action(action_id: str, params: dict, max_wait_seconds: int = 30, poll_in
             if polled.get("status") == "completed":
                 return polled
             if polled.get("status") == "failed":
-                raise WireError(f"Wire job {job_id} failed: {polled.get('data', {}).get('error')}")
+                raise WireError(f"Wire job {job_id} failed: {_extract_failure_reason(polled)}")
         raise WireError(f"Wire job {job_id} timed out after {max_wait_seconds}s")
 
     return result
@@ -77,15 +104,35 @@ def run_action(action_id: str, params: dict, max_wait_seconds: int = 30, poll_in
 def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_domain: str = "in"):
     """
     Search live Indeed job postings via Wire (in_search_jobs, async).
-    Returns (jobs_list, used_live: bool).
+
+    Normalizes the location first (e.g. "Bangalore" -> "Bengaluru, Karnataka").
+    If the normalized location returns zero jobs, retries once with a
+    simplified variant (e.g. drops the state) before giving up.
+
+    Returns (jobs_list, used_live: bool, resolved_location: str).
     """
+    resolved = normalize_location(location)
+
     raw = run_action("in_search_jobs", {
         "query": query,
-        "location": location,
+        "location": resolved,
         "country_domain": country_domain,
     })
     jobs = raw.get("data", {}).get("data", {}).get("jobs", [])
-    return jobs, True
+
+    if not jobs:
+        fallback_location = simplified_fallback(resolved)
+        if fallback_location != resolved:
+            raw = run_action("in_search_jobs", {
+                "query": query,
+                "location": fallback_location,
+                "country_domain": country_domain,
+            })
+            jobs = raw.get("data", {}).get("data", {}).get("jobs", [])
+            if jobs:
+                resolved = fallback_location
+
+    return jobs, True, resolved
 
 
 def get_job_details(job_key: str = None, job_url: str = None, country_domain: str = "in"):
@@ -113,10 +160,11 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "catalog":
         print(json.dumps(get_catalog(sys.argv[2]), indent=2))
     elif len(sys.argv) >= 2 and sys.argv[1] == "test":
-        jobs, ok = search_jobs("backend developer")
+        jobs, ok, resolved = search_jobs("backend developer", sys.argv[2] if len(sys.argv) > 2 else "Bangalore")
+        print(f"Resolved location: {resolved}")
         print(f"Got {len(jobs)} jobs. First one:")
         print(json.dumps(jobs[0], indent=2) if jobs else "none")
     else:
         print("Usage:")
         print("  python wire_client.py catalog <service_name>")
-        print("  python wire_client.py test")
+        print("  python wire_client.py test [location]")

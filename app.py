@@ -8,6 +8,7 @@ import streamlit as st
 from wire_client import search_jobs, WireError
 from analyzer import analyze_gap
 from location_normalizer import suggestions
+from skill_aliases import normalize_skills
 
 st.set_page_config(page_title="GapCheck", page_icon=":dart:", layout="centered")
 
@@ -136,6 +137,38 @@ div[data-testid="stForm"] label { color: #C9C6C0 !important; font-size: 0.88rem 
 .gc-job-company a { color: #FF9A6B; text-decoration: none; font-weight: 500; }
 .gc-job-company a:hover { text-decoration: underline; }
 
+.gc-breakdown-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.55rem 0;
+    border-bottom: 1px solid #21242b;
+    font-size: 0.92rem;
+}
+.gc-breakdown-row:last-child { border-bottom: none; }
+.gc-breakdown-area { color: #E8E6E1; font-weight: 500; }
+.gc-breakdown-note { color: #7C7973; font-size: 0.82rem; margin-top: 0.1rem; }
+.gc-status-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.22rem 0.6rem;
+    border-radius: 999px;
+    white-space: nowrap;
+    margin-left: 1rem;
+}
+.gc-status-strong { background: rgba(122, 200, 150, 0.12); border: 1px solid rgba(122, 200, 150, 0.35); color: #9FDDB4; }
+.gc-status-partial { background: rgba(255, 154, 107, 0.12); border: 1px solid rgba(255, 154, 107, 0.35); color: #FF9A6B; }
+.gc-status-missing { background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35); color: #FF6B6B; }
+.gc-time-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.74rem;
+    color: #7C7973;
+    margin-left: 0.5rem;
+}
+
 .gc-resolved-location {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8rem;
@@ -217,8 +250,10 @@ if submitted:
             )
             st.stop()
 
+        normalized_skills = normalize_skills(user_skills)
+
         with st.status("Analyzing your gap against real postings...", expanded=False) as status:
-            result = analyze_gap(user_skills, target_role, jobs)
+            result = analyze_gap(normalized_skills, target_role, jobs)
             status.update(label="Analysis complete")
 
         st.markdown('<hr class="gc-divider">', unsafe_allow_html=True)
@@ -240,6 +275,22 @@ if submitted:
             unsafe_allow_html=True,
         )
 
+        if result.get("score_breakdown"):
+            st.markdown('<div class="gc-section-label">WHY THIS SCORE</div>', unsafe_allow_html=True)
+            rows = ""
+            for b in result["score_breakdown"]:
+                status = b.get("status", "partial").lower()
+                if status not in ("strong", "partial", "missing"):
+                    status = "partial"
+                rows += (
+                    '<div class="gc-breakdown-row">'
+                    '<div><div class="gc-breakdown-area">' + b.get("area", "") + '</div>'
+                    '<div class="gc-breakdown-note">' + b.get("note", "") + '</div></div>'
+                    '<span class="gc-status-badge gc-status-' + status + '">' + status + '</span>'
+                    '</div>'
+                )
+            st.markdown('<div class="gc-score-card">' + rows + '</div>', unsafe_allow_html=True)
+
         if result.get("strengths"):
             st.markdown('<div class="gc-section-label">WHAT YOU\'VE ALREADY GOT</div>', unsafe_allow_html=True)
             pills = "".join('<span class="gc-strength-pill">' + s + '</span>' for s in result["strengths"])
@@ -248,14 +299,25 @@ if submitted:
         if result.get("gaps"):
             st.markdown('<div class="gc-section-label">GAPS TO CLOSE</div>', unsafe_allow_html=True)
             for g in result["gaps"]:
-                with st.expander(g.get("skill", "Gap")):
+                label = g.get("skill", "Gap")
+                if g.get("time_estimate"):
+                    label += "  ·  ~" + g["time_estimate"]
+                with st.expander(label):
                     st.write("**Why it matters:** " + g.get("why_it_matters", ""))
                     st.write("**How to fix:** " + g.get("how_to_fix", ""))
 
         if result.get("top_3_actions"):
             st.markdown('<div class="gc-section-label">DO THIS FIRST</div>', unsafe_allow_html=True)
             for i, action in enumerate(result["top_3_actions"], 1):
-                st.markdown(str(i) + ". " + action)
+                if isinstance(action, dict):
+                    text = action.get("action", "")
+                    time_est = action.get("time_estimate", "")
+                    line = str(i) + ". " + text
+                    if time_est:
+                        line += "  `~" + time_est + "`"
+                    st.markdown(line)
+                else:
+                    st.markdown(str(i) + ". " + str(action))
 
         if result.get("matching_jobs"):
             st.markdown('<div class="gc-section-label">LIVE POSTINGS WORTH A LOOK</div>', unsafe_allow_html=True)

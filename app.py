@@ -185,8 +185,9 @@ with st.form("gap_form"):
     with col2:
         location = st.text_input(
             "Location",
-            placeholder="Example: Bengaluru, India / NYC / London / Vijayawada",
-            help="Type any city, anywhere — we'll normalize it automatically.",
+            placeholder="Example: Bangalore, Hyderabad, Mumbai, Vijayawada...",
+            help="Type any Indian city or abbreviation — we'll normalize it automatically. "
+                 "(Wire's live job search currently covers India only.)",
         )
     submitted = st.form_submit_button("Run Gap Check", use_container_width=True)
 

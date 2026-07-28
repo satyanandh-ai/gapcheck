@@ -2,3 +2,7 @@
 requests
 python-dotenv
 groq
+scikit-learn
+numpy
+pypdf
+python-docx

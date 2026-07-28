@@ -9,6 +9,8 @@ from wire_client import search_jobs, WireError
 from analyzer import analyze_gap
 from location_normalizer import suggestions
 from skill_aliases import normalize_skills
+from retrieval import retrieve_relevant_jobs
+from resume_parser import extract_text_from_upload, parse_profile, profile_to_query_text
 
 st.set_page_config(page_title="GapCheck", page_icon=":dart:", layout="centered")
 
@@ -169,6 +171,14 @@ div[data-testid="stForm"] label { color: #C9C6C0 !important; font-size: 0.88rem 
     margin-left: 0.5rem;
 }
 
+.gc-citation {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: #FF9A6B;
+    margin-top: 0.25rem;
+    opacity: 0.85;
+}
+
 .gc-resolved-location {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.8rem;
@@ -199,6 +209,43 @@ div[data-testid="stExpander"] {
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
+
+def citation_line(item: dict) -> str:
+    """
+    Builds the evidence line for a score_breakdown row or gap, from
+    the trusted citation data analyzer.py attached (never from
+    LLM-generated text) - e.g. "Strong evidence - 4 of 8 retrieved
+    postings (50%) - Google, Nvidia".
+    """
+    citations = item.get("citations") or []
+    if not citations:
+        return ""
+    companies = []
+    for c in citations:
+        name = c.get("company")
+        if name and name not in companies:
+            companies.append(name)
+    company_str = ", ".join(companies[:4])
+    if len(companies) > 4:
+        company_str += f" +{len(companies) - 4} more"
+
+    tier_labels = {
+        "strong": "Strong evidence",
+        "moderate": "Moderate evidence",
+        "limited": "Limited evidence",
+    }
+    tier = tier_labels.get(item.get("evidence_tier"), "Evidence")
+
+    total = item.get("cited_total")
+    count = item.get("cited_count", len(citations))
+    pct = item.get("coverage_pct")
+    of_total = f" of {total}" if total else ""
+    pct_str = f" ({pct}%)" if pct is not None else ""
+    avg_rel = item.get("avg_relevance")
+    rel_str = f" · avg retrieval relevance {avg_rel:.2f}" if avg_rel is not None else ""
+    return f"{tier} — {count}{of_total} retrieved postings{pct_str}{rel_str} — {company_str}"
+
+
 st.markdown('<div class="gc-eyebrow">CAREER DIAGNOSTIC</div>', unsafe_allow_html=True)
 st.markdown('<div class="gc-title">GapCheck</div>', unsafe_allow_html=True)
 st.markdown(
@@ -211,6 +258,13 @@ with st.form("gap_form"):
         "Your current skills / experience",
         placeholder="e.g. Python, basic SQL, built 2 small Flask projects, no production experience",
         height=100,
+    )
+    resume_file = st.file_uploader(
+        "Or upload your resume (optional)",
+        type=["pdf", "docx", "txt"],
+        help="PDF, Word (.docx), or plain text. We'll extract your skills, projects, "
+             "certifications, and experience level automatically - add anything extra "
+             "in the box above.",
     )
     col1, col2 = st.columns(2)
     with col1:
@@ -225,11 +279,48 @@ with st.form("gap_form"):
     submitted = st.form_submit_button("Run Gap Check", use_container_width=True)
 
 if submitted:
-    if not user_skills or not target_role:
-        st.error("Please fill in your skills and a target role.")
+    if not (user_skills or resume_file) or not target_role:
+        st.error("Please fill in your skills (or upload a resume) and a target role.")
         st.stop()
 
     try:
+        resume_text = extract_text_from_upload(resume_file) if resume_file else ""
+        if resume_file and not resume_text.strip():
+            st.warning(
+                "Couldn't extract text from **" + resume_file.name + "** "
+                "(it may be a scanned/image-only file). Continuing with the skills box only."
+            )
+
+        normalized_skills = normalize_skills(user_skills)
+        combined_raw = "\n\n".join(t for t in [resume_text, normalized_skills] if t.strip())
+
+        with st.status("Reading your skills/resume...", expanded=False) as status:
+            profile = parse_profile(combined_raw)
+            status.update(label="Profile parsed")
+
+        query_text = profile_to_query_text(profile) or combined_raw
+
+        with st.expander("What we parsed from your input", expanded=False):
+            if profile.get("summary"):
+                st.markdown("**Summary:** " + profile["summary"])
+            if profile.get("skills"):
+                pills = "".join('<span class="gc-strength-pill">' + s + '</span>' for s in profile["skills"])
+                st.markdown("**Skills**", unsafe_allow_html=True)
+                st.markdown(pills, unsafe_allow_html=True)
+            if profile.get("projects"):
+                st.markdown("**Projects**")
+                for p in profile["projects"]:
+                    if isinstance(p, dict):
+                        st.markdown("- **" + p.get("name", "") + "** — " + p.get("description", ""))
+                    else:
+                        st.markdown("- " + str(p))
+            if profile.get("certifications"):
+                st.markdown("**Certifications:** " + ", ".join(profile["certifications"]))
+            if profile.get("years_experience") and profile["years_experience"] != "not stated":
+                st.markdown("**Experience:** " + profile["years_experience"])
+            if not any([profile.get("skills"), profile.get("projects"), profile.get("certifications")]):
+                st.markdown("_Nothing structured was extracted - your raw input will still be used as-is._")
+
         with st.status("Searching live Indeed postings via Wire...", expanded=False) as status:
             jobs, live, resolved_location = search_jobs(target_role, location=location)
             status.update(label="Found " + str(len(jobs)) + " live postings via Wire")
@@ -250,10 +341,12 @@ if submitted:
             )
             st.stop()
 
-        normalized_skills = normalize_skills(user_skills)
+        with st.status("Ranking postings by relevance to your skills...", expanded=False) as status:
+            ranked_jobs = retrieve_relevant_jobs(query_text, target_role, jobs, top_k=15)
+            status.update(label="Selected " + str(len(ranked_jobs)) + " most relevant postings")
 
         with st.status("Analyzing your gap against real postings...", expanded=False) as status:
-            result = analyze_gap(normalized_skills, target_role, jobs)
+            result = analyze_gap(query_text, target_role, ranked_jobs)
             status.update(label="Analysis complete")
 
         st.markdown('<hr class="gc-divider">', unsafe_allow_html=True)
@@ -282,10 +375,14 @@ if submitted:
                 status = b.get("status", "partial").lower()
                 if status not in ("strong", "partial", "missing"):
                     status = "partial"
+                note_html = '<div class="gc-breakdown-note">' + b.get("note", "") + '</div>'
+                cite = citation_line(b)
+                if cite:
+                    note_html += '<div class="gc-citation">' + cite + '</div>'
                 rows += (
                     '<div class="gc-breakdown-row">'
                     '<div><div class="gc-breakdown-area">' + b.get("area", "") + '</div>'
-                    '<div class="gc-breakdown-note">' + b.get("note", "") + '</div></div>'
+                    + note_html + '</div>'
                     '<span class="gc-status-badge gc-status-' + status + '">' + status + '</span>'
                     '</div>'
                 )
@@ -305,6 +402,17 @@ if submitted:
                 with st.expander(label):
                     st.write("**Why it matters:** " + g.get("why_it_matters", ""))
                     st.write("**How to fix:** " + g.get("how_to_fix", ""))
+                    cite = citation_line(g)
+                    if cite:
+                        st.markdown('<div class="gc-citation">' + cite + '</div>', unsafe_allow_html=True)
+                        for c in g.get("citations", []):
+                            if c.get("url"):
+                                st.markdown(
+                                    '<div class="gc-citation">&rarr; <a href="' + c["url"]
+                                    + '" target="_blank">' + c.get("title", "posting") + ' @ '
+                                    + c.get("company", "") + '</a></div>',
+                                    unsafe_allow_html=True,
+                                )
 
         if result.get("top_3_actions"):
             st.markdown('<div class="gc-section-label">DO THIS FIRST</div>', unsafe_allow_html=True)
@@ -330,9 +438,19 @@ if submitted:
                     unsafe_allow_html=True,
                 )
 
-        with st.expander("Raw data: " + str(len(jobs)) + " live postings pulled via Wire"):
-            for j in jobs:
-                st.markdown("- " + j.get("title", "") + " - " + j.get("company", "") + " (" + str(j.get("date_posted", "")) + ")")
+        retrieval_method = ranked_jobs[0].get("_retrieval_method", "tfidf") if ranked_jobs else "tfidf"
+        method_label = "semantic embeddings" if retrieval_method == "embeddings" else "TF-IDF (keyword)"
+        with st.expander(
+            "Raw data: " + str(len(jobs)) + " live postings pulled via Wire, "
+            "top " + str(len(ranked_jobs)) + " used for analysis (ranked by " + method_label + ")"
+        ):
+            for j in ranked_jobs:
+                relevance = j.get("_relevance")
+                relevance_str = " · relevance " + f"{relevance:.2f}" if relevance is not None else ""
+                st.markdown(
+                    "- " + j.get("title", "") + " - " + j.get("company", "")
+                    + " (" + str(j.get("date_posted", "")) + ")" + relevance_str
+                )
 
     except WireError as e:
         st.error("Wire API error: " + str(e))

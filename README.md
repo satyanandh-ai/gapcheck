@@ -1,4 +1,4 @@
-﻿K# 🎯 GapCheck
+﻿ 🎯 GapCheck
 
 ### An honest gap check between your skills and the jobs that actually exist right now.
 

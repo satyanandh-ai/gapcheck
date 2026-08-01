@@ -127,9 +127,27 @@ def get_available_search_actions() -> dict:
     return found
 
 
-def run_action(action_id: str, params: dict, max_wait_seconds: int = 60, poll_interval: float = 2.0, debug: bool = True):
+# Wire's scraper occasionally can't reach Indeed for a moment - the
+# failure message itself says "try again later". These markers identify
+# that class of transient failure so we can retry automatically instead
+# of surfacing it to the user as if the search were permanently broken.
+TRANSIENT_ERROR_MARKERS = (
+    "try again later",
+    "scraper_error",
+    "unable to access the website",
+    "temporarily unavailable",
+    "rate limit",
+)
+
+
+def _is_transient_failure(reason: str) -> bool:
+    reason_l = (reason or "").lower()
+    return any(marker in reason_l for marker in TRANSIENT_ERROR_MARKERS)
+
+
+def _run_action_once(action_id: str, params: dict, max_wait_seconds: float, poll_interval: float, debug: bool):
     """
-    Executes a Wire action and waits for the result, handling both:
+    Executes a Wire action once and waits for the result, handling both:
       - sync actions that return data immediately
       - async actions that return {"job_id": ...} and need polling
     Returns the full parsed JSON response once status == "completed".
@@ -169,9 +187,49 @@ def run_action(action_id: str, params: dict, max_wait_seconds: int = 60, poll_in
     return result
 
 
+def run_action(
+    action_id: str,
+    params: dict,
+    max_wait_seconds: int = 60,
+    poll_interval: float = 2.0,
+    debug: bool = True,
+    max_retries: int = 2,
+    retry_delay: float = 3.0,
+    status_callback=None,
+):
+    """
+    Executes a Wire action and waits for the result (see
+    _run_action_once). Automatically retries transient scraper
+    failures - Wire's own failure message says "try again later", so a
+    fresh attempt often just succeeds - up to max_retries times, with
+    retry_delay seconds between attempts. Non-transient failures (bad
+    params, unsupported action, permanent errors) are raised
+    immediately without retrying, since retrying those would just
+    waste time on something that isn't going to change.
+
+    status_callback, if given, is called with a short human-readable
+    string before each retry - lets callers (like the Streamlit UI)
+    show "retrying..." instead of the request silently taking longer.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _run_action_once(action_id, params, max_wait_seconds, poll_interval, debug)
+        except WireError as e:
+            if attempt > max_retries or not _is_transient_failure(str(e)):
+                raise
+            msg = f"Wire hit a temporary error, retrying ({attempt}/{max_retries})..."
+            if debug:
+                print(f"[wire] {msg} - {e}")
+            if status_callback:
+                status_callback(msg)
+            time.sleep(retry_delay)
+
+
 # --- Indeed actions ------------------------------------------
 
-def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_domain: str = None):
+def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_domain: str = None, status_callback=None):
     """
     Search live Indeed job postings via Wire.
 
@@ -182,9 +240,13 @@ def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_doma
     If country_domain is explicitly passed, it overrides auto-detection.
 
     Raises WireError immediately (no hang/timeout) if the resolved
-    country has no matching Wire action available.
+    country has no matching Wire action available. Transient scraper
+    failures are retried automatically (see run_action) before raising.
 
-    Returns (jobs_list, used_live: bool, resolved_location: str).
+    status_callback, if given, is passed through to run_action to
+    surface retry status (e.g. to a Streamlit spinner).
+
+    Returns (jobs_list, used_live: bool, resolved_location: str, country_domain: str).
     """
     resolved = normalize_location_full(location)
     location_str = resolved["location"]
@@ -209,7 +271,7 @@ def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_doma
         "query": query,
         "location": location_str,
         "country_domain": detected_country,
-    })
+    }, status_callback=status_callback)
     jobs = raw.get("data", {}).get("data", {}).get("jobs", [])
 
     if not jobs:
@@ -219,22 +281,40 @@ def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_doma
                 "query": query,
                 "location": fallback_location,
                 "country_domain": detected_country,
-            })
+            }, status_callback=status_callback)
             jobs = raw.get("data", {}).get("data", {}).get("jobs", [])
             if jobs:
                 location_str = fallback_location
 
-    return jobs, True, location_str
+    return jobs, True, location_str, detected_country
 
 
-def get_job_details(job_key: str = None, job_url: str = None, country_domain: str = "in"):
-    """Get full details for one Indeed job (in_job_details, async)."""
+def get_job_details(
+    job_key: str = None,
+    job_url: str = None,
+    country_domain: str = "in",
+    max_wait_seconds: int = 60,
+    max_retries: int = 2,
+    retry_delay: float = 3.0,
+):
+    """
+    Get full details for one Indeed job (in_job_details, async).
+
+    max_wait_seconds/max_retries/retry_delay are exposed (rather than
+    hardcoded) so callers doing bulk enrichment - e.g. fetching full
+    descriptions for several postings to improve retrieval - can use a
+    tighter budget per call than a single one-off lookup would need,
+    since a slow detail fetch there should be skipped, not blocked on.
+    """
     params = {"country_domain": country_domain}
     if job_key:
         params["job_key"] = job_key
     if job_url:
         params["job_url"] = job_url
-    raw = run_action("in_job_details", params)
+    raw = run_action(
+        "in_job_details", params,
+        max_wait_seconds=max_wait_seconds, max_retries=max_retries, retry_delay=retry_delay,
+    )
     return raw.get("data", {}).get("data", {}), True
 
 
@@ -255,8 +335,8 @@ if __name__ == "__main__":
         print(json.dumps(get_available_search_actions(), indent=2))
     elif len(sys.argv) >= 2 and sys.argv[1] == "test":
         loc = sys.argv[2] if len(sys.argv) > 2 else "Bangalore"
-        jobs, ok, resolved = search_jobs("backend developer", loc)
-        print(f"Resolved location: {resolved}")
+        jobs, ok, resolved, country = search_jobs("backend developer", loc)
+        print(f"Resolved location: {resolved} (country: {country})")
         print(f"Got {len(jobs)} jobs. First one:")
         print(json.dumps(jobs[0], indent=2) if jobs else "none")
     else:

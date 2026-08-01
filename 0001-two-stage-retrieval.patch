@@ -1,0 +1,488 @@
+From 21864b84d6c80d40d56c7b2ffc8482975367af0f Mon Sep 17 00:00:00 2001
+From: satyanandh-ai <satyanandh-ai@users.noreply.github.com>
+Date: Sat, 1 Aug 2026 17:51:42 +0000
+Subject: [PATCH] Two-stage retrieval: rank by snippet, refine top candidates
+ with full job descriptions
+
+Short search-result snippets can undersell (or oversell) a posting -
+years-of-experience and specific tech stacks often only appear in the
+full description, not the 2-line preview. Retrieval now works in two
+bounded stages:
+
+- retrieval.py: stage 1 ranks all postings by snippet (as before, no
+  extra network calls). Stage 2 fetches the FULL description (via
+  Wire's in_job_details) for only the top candidates, concurrently
+  (bounded worker pool), with a tight per-call timeout and an overall
+  stage timeout - a slow/failed fetch just leaves that posting on its
+  snippet rather than blocking the search. Disabled by default unless
+  a country_domain is passed, so existing callers are unaffected.
+- wire_client.py: search_jobs now also returns the resolved country
+  code (needed to route detail fetches). get_job_details exposes
+  max_wait_seconds/max_retries/retry_delay so bulk enrichment can use
+  a tighter budget than a one-off lookup would.
+- analyzer.py: the LLM now reads the full description (up to 3000
+  chars) when available, instead of a 500-char snippet, and is told
+  explicitly which postings have full text vs a short preview.
+- app.py: threads the resolved country through, surfaces enrichment
+  progress in the status widget, and flags in the raw-data view which
+  postings' ranking used a full description.
+
+NOTE: the exact field name Wire's in_job_details uses for the full
+description text is unconfirmed (no live API access to verify) -
+_fetch_full_description checks several plausible keys defensively.
+Needs a real run to confirm which one Wire actually returns.
+---
+ analyzer.py    |  19 ++++-
+ app.py         |  11 ++-
+ retrieval.py   | 228 +++++++++++++++++++++++++++++++++++++++++++------
+ wire_client.py |  32 +++++--
+ 4 files changed, 249 insertions(+), 41 deletions(-)
+
+diff --git a/analyzer.py b/analyzer.py
+index c7b5115..e0d8297 100644
+--- a/analyzer.py
++++ b/analyzer.py
+@@ -28,9 +28,13 @@ You will be given:
+    user's specific skills/role (see each posting's relevance_to_candidate
+    score, 0-1 — higher means it's a closer match to this candidate). Each
+    posting has a "job_index" - use this to cite postings, never restate
+-   or invent a company name/URL yourself.
++   or invent a company name/URL yourself. Each posting's "description"
++   field is the FULL job description when "description_is_full" is
++   true, or just a short search-result preview when it's false - treat
++   full descriptions as more authoritative on specifics like required
++   years of experience, since a short preview may not mention them at all.
+ Your job: compare what these real postings actually ask for (read the
+-snippets carefully) against what the user says they know, and produce a
++descriptions carefully) against what the user says they know, and produce a
+ gap analysis grounded in the actual postings, not generic advice. Weigh
+ higher-relevance postings more heavily when deciding what's a "real" gap
+ versus a one-off requirement from a single unusual posting.
+@@ -94,12 +98,21 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
+     index_to_job = {}
+     for i, job in enumerate(relevant_postings):
+         index_to_job[i] = job
++        # Prefer the full description (fetched by retrieval.py's
++        # enrichment stage) over the short search-result snippet when
++        # available - it's what the LLM should actually read the
++        # requirements from. Larger char budget since it's much richer
++        # text than a 2-line preview.
++        has_full = bool(job.get("full_description"))
++        source_text = job.get("full_description") or job.get("snippet")
++        char_budget = 3000 if has_full else 500
+         trimmed_postings.append({
+             "job_index": i,
+             "title": job.get("title"),
+             "company": job.get("company"),
+             "location": job.get("location"),
+-            "snippet": _strip_html(job.get("snippet"))[:500],
++            "description": _strip_html(source_text)[:char_budget],
++            "description_is_full": has_full,
+             "url": job.get("url"),
+             "relevance_to_candidate": job.get("_relevance"),
+         })
+diff --git a/app.py b/app.py
+index fdaa657..bd20a88 100644
+--- a/app.py
++++ b/app.py
+@@ -322,7 +322,7 @@ if submitted:
+                 st.markdown("_Nothing structured was extracted - your raw input will still be used as-is._")
+ 
+         with st.status("Searching live Indeed postings via Wire...", expanded=False) as status:
+-            jobs, live, resolved_location = search_jobs(
++            jobs, live, resolved_location, resolved_country = search_jobs(
+                 target_role, location=location,
+                 status_callback=lambda msg: status.update(label=msg),
+             )
+@@ -345,7 +345,11 @@ if submitted:
+             st.stop()
+ 
+         with st.status("Ranking postings by relevance to your skills...", expanded=False) as status:
+-            ranked_jobs = retrieve_relevant_jobs(query_text, target_role, jobs, top_k=15)
++            ranked_jobs = retrieve_relevant_jobs(
++                query_text, target_role, jobs, top_k=15,
++                country_domain=resolved_country,
++                status_callback=lambda msg: status.update(label=msg),
++            )
+             status.update(label="Selected " + str(len(ranked_jobs)) + " most relevant postings")
+ 
+         with st.status("Analyzing your gap against real postings...", expanded=False) as status:
+@@ -450,9 +454,10 @@ if submitted:
+             for j in ranked_jobs:
+                 relevance = j.get("_relevance")
+                 relevance_str = " · relevance " + f"{relevance:.2f}" if relevance is not None else ""
++                full_desc_str = " · full description" if j.get("_full_description_used") else ""
+                 st.markdown(
+                     "- " + j.get("title", "") + " - " + j.get("company", "")
+-                    + " (" + str(j.get("date_posted", "")) + ")" + relevance_str
++                    + " (" + str(j.get("date_posted", "")) + ")" + relevance_str + full_desc_str
+                 )
+ 
+     except WireError as e:
+diff --git a/retrieval.py b/retrieval.py
+index a7b0029..c141f46 100644
+--- a/retrieval.py
++++ b/retrieval.py
+@@ -8,13 +8,26 @@ relevant to a specific user's skills + target role — a broad query like
+ stacks, or sub-roles. Previously analyzer.py just took the first N
+ postings in whatever order Wire's API happened to return them.
+ 
+-This module turns that into real retrieval: every posting is embedded
+-and scored against a query built from the user's stated skills and
+-target role, and only the top-K most relevant postings are handed to
+-the LLM. That's the "R" in RAG — analyzer.py's Groq call is the "G",
+-generating grounded in whatever this step retrieves.
++This module turns that into real retrieval, in two stages:
+ 
+-Two ranking strategies, in priority order:
++STAGE 1 - cheap first pass: every posting Wire returned is scored
++against the user's profile using only the short search-result snippet
++(title, company, ~2-line preview) - no extra network calls.
++
++STAGE 2 - full-description refinement: the strongest candidates from
++stage 1 have their FULL job description fetched via Wire's
++in_job_details action, and are re-ranked using that much richer text.
++A two-line snippet can easily undersell (or oversell) a posting -
++"5+ years" might only appear in the full requirements section, not the
++preview. This is deliberately bounded, not applied to every posting:
++fetching full details is itself a live, async Wire call per posting, so
++enriching all 50+ postings a broad search can return would make every
++gap-check painfully slow. Only the current top candidates get enriched,
++fetches run concurrently with a bounded worker pool, and any individual
++failure or slow response just leaves that one posting on its snippet -
++degrading gracefully rather than blocking the whole search.
++
++Two ranking strategies, in priority order, used at both stages:
+ 
+ 1. Semantic (OpenAI text-embedding-3-small), if OPENAI_API_KEY is set.
+    Understands "React" ~= "frontend framework", "GCP" ~= "Google Cloud"
+@@ -25,23 +38,46 @@ Two ranking strategies, in priority order:
+    limit, bad key) - a broken *upgrade* should never break the basic
+    gap-check.
+ 
+-Both are query-time retrieval over a small, per-request corpus (the
+-postings Wire just returned for this one search) - no persistent
++All of this is query-time retrieval over a small, per-request corpus
++(the postings Wire just returned for this one search) - no persistent
+ vector store is needed since each search's corpus is used once and
+ then discarded.
+ """
+ 
++import concurrent.futures
+ import os
+ import re
++
+ import numpy as np
+ import requests
+ from sklearn.feature_extraction.text import TfidfVectorizer
+ from sklearn.metrics.pairwise import cosine_similarity
+ 
++from wire_client import get_job_details, WireError
++
+ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+ EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
+ 
++# --- Stage 2 (full-description enrichment) tuning ------------------
++# These bound the worst-case latency/cost of enrichment: at most
++# ENRICH_LIMIT postings get a full-detail fetch, at most
++# ENRICH_WORKERS run concurrently, each individual fetch gets at most
++# ENRICH_PER_JOB_MAX_WAIT seconds (shorter than a one-off lookup would
++# use - this is a refinement step, not the critical path), and the
++# whole enrichment stage gives up after ENRICH_OVERALL_TIMEOUT seconds
++# regardless of how many postings are still in flight.
++ENRICH_LIMIT = 10
++ENRICH_WORKERS = 5
++ENRICH_PER_JOB_MAX_WAIT = 15
++ENRICH_PER_JOB_MAX_RETRIES = 1
++ENRICH_OVERALL_TIMEOUT = 45
++
++# Fields Wire's in_job_details might use for the full description text.
++# UNCONFIRMED - checked defensively in priority order since this hasn't
++# been verified against a live response.
++DESCRIPTION_FIELD_CANDIDATES = ("description", "job_description", "full_description", "snippet")
++
+ 
+ def _strip_html(text):
+     """Remove HTML tags and collapse whitespace from a snippet string."""
+@@ -53,11 +89,18 @@ def _strip_html(text):
+ 
+ 
+ def _job_to_document(job: dict) -> str:
+-    """Flatten one job posting into a single text chunk for retrieval."""
++    """
++    Flattens one job posting into a single text chunk for retrieval.
++    Prefers the full description (set by enrich_with_full_descriptions)
++    over the short search-result snippet when available, since it's a
++    far more complete picture of what the posting actually requires.
++    """
++    text = job.get("full_description") or job.get("snippet")
++    max_chars = 4000 if job.get("full_description") else 800
+     parts = [
+         job.get("title") or "",
+         job.get("company") or "",
+-        _strip_html(job.get("snippet"))[:800],
++        _strip_html(text)[:max_chars],
+     ]
+     return " ".join(p for p in parts if p)
+ 
+@@ -118,46 +161,175 @@ def _rank_by_tfidf(documents: list, query: str):
+         return None
+ 
+ 
+-def retrieve_relevant_jobs(user_skills: str, target_role: str, jobs: list, top_k: int = 15) -> list:
++def _rank(jobs: list, query: str):
++    """
++    Scores `jobs` against `query`, embeddings-first with a TF-IDF
++    fallback (see module docstring). Returns (scores, method) where
++    method is "embeddings" or "tfidf". Never raises - if both ranking
++    strategies fail (e.g. empty vocabulary), returns (None, "none")
++    and the caller should treat the input order as unranked.
++    """
++    documents = [_job_to_document(j) for j in jobs]
++
++    if OPENAI_API_KEY:
++        scores = _rank_by_embeddings(documents, query)
++        if scores is not None:
++            return scores, "embeddings"
++
++    scores = _rank_by_tfidf(documents, query)
++    if scores is not None:
++        return scores, "tfidf"
++
++    return None, "none"
++
++
++def _fetch_full_description(job: dict, country_domain: str) -> str:
++    """
++    Fetches the full job description for one posting via Wire's
++    in_job_details action. Returns "" on any failure - missing URL,
++    WireError, timeout, unrecognized response shape - so the caller
++    just keeps using that posting's snippet, exactly like it would
++    without enrichment at all.
++    """
++    url = job.get("url")
++    if not url:
++        return ""
++    try:
++        details, _ = get_job_details(
++            job_url=url,
++            country_domain=country_domain,
++            max_wait_seconds=ENRICH_PER_JOB_MAX_WAIT,
++            max_retries=ENRICH_PER_JOB_MAX_RETRIES,
++            retry_delay=2.0,
++        )
++        for key in DESCRIPTION_FIELD_CANDIDATES:
++            text = details.get(key)
++            if text:
++                return text
++    except (WireError, Exception) as e:
++        print(f"[retrieval] full-description fetch failed for {url}: {e}")
++    return ""
++
++
++def enrich_with_full_descriptions(jobs: list, country_domain: str, limit: int = ENRICH_LIMIT, status_callback=None) -> list:
++    """
++    Fetches full job descriptions for up to `limit` postings (the
++    postings the caller passes in - it should already have narrowed
++    to its best candidates), concurrently, and returns a new list of
++    jobs with `full_description` set wherever the fetch succeeded.
++
++    Best-effort and time-boxed: any individual failure is silently
++    skipped (that posting just keeps its snippet), and the whole stage
++    gives up after ENRICH_OVERALL_TIMEOUT seconds even if some fetches
++    are still in flight - a slow enrichment pass should degrade, not
++    block the rest of the gap-check.
++    """
++    if not jobs or not country_domain:
++        return jobs
++
++    to_fetch = jobs[:limit]
++    rest = jobs[limit:]
++    enriched = [dict(j) for j in to_fetch]
++    fetched_texts = {}
++
++    with concurrent.futures.ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
++        future_to_idx = {
++            pool.submit(_fetch_full_description, job, country_domain): i
++            for i, job in enumerate(enriched)
++        }
++        try:
++            for future in concurrent.futures.as_completed(future_to_idx, timeout=ENRICH_OVERALL_TIMEOUT):
++                idx = future_to_idx[future]
++                try:
++                    fetched_texts[idx] = future.result()
++                except Exception:
++                    fetched_texts[idx] = ""
++                if status_callback:
++                    status_callback(f"Fetching full job descriptions ({len(fetched_texts)}/{len(enriched)})...")
++        except concurrent.futures.TimeoutError:
++            print(
++                f"[retrieval] full-description enrichment timed out after {ENRICH_OVERALL_TIMEOUT}s, "
++                f"using partial results ({len(fetched_texts)}/{len(enriched)})"
++            )
++
++    for idx, text in fetched_texts.items():
++        if text:
++            enriched[idx]["full_description"] = text
++
++    return enriched + rest
++
++
++def retrieve_relevant_jobs(
++    user_skills: str,
++    target_role: str,
++    jobs: list,
++    top_k: int = 15,
++    country_domain: str = None,
++    enrich_limit: int = ENRICH_LIMIT,
++    status_callback=None,
++) -> list:
+     """
+     Ranks `jobs` (raw postings from wire_client.search_jobs) by
+     relevance to the user's skills + target role, and returns the
+     top_k most relevant postings, each annotated with:
+       - `_relevance`: cosine similarity score against the query
+       - `_retrieval_method`: "embeddings" or "tfidf", whichever ranked it
++      - `_full_description_used`: True if this posting's ranking (and
++        the text sent to the LLM) is based on the full description,
++        not just the short snippet
++
++    Two-stage: a cheap snippet-based pass ranks everything, then (if
++    `country_domain` is given) the top candidates get their full
++    description fetched and are re-ranked with that richer text - see
++    module docstring for why this is bounded rather than exhaustive.
++    Pass country_domain=None (or enrich_limit=0) to skip stage 2
++    entirely and use snippet-only ranking, e.g. if latency matters more
++    than ranking precision for a given call site.
+ 
+     Degrades gracefully at every step: no OPENAI_API_KEY -> TF-IDF.
+     Embedding call fails -> TF-IDF. TF-IDF also fails (e.g. empty
+-    vocabulary) -> original order, unranked. A broken ranking step
+-    should never break the whole gap-check.
++    vocabulary) -> original order, unranked. Enrichment fails or times
++    out -> falls back to the stage-1 (snippet-based) ranking. A broken
++    ranking step should never break the whole gap-check.
+     """
+     if not jobs:
+         return []
+ 
+     effective_k = min(top_k, len(jobs))
+-    documents = [_job_to_document(j) for j in jobs]
+     query = f"{target_role}. Candidate skills and experience: {user_skills}"
+ 
+-    method = "tfidf"
+-    scores = None
+-    if OPENAI_API_KEY:
+-        scores = _rank_by_embeddings(documents, query)
+-        if scores is not None:
+-            method = "embeddings"
+-
+-    if scores is None:
+-        scores = _rank_by_tfidf(documents, query)
+-        method = "tfidf"
+-
+-    if scores is None:
++    stage1_scores, stage1_method = _rank(jobs, query)
++    if stage1_scores is None:
+         return jobs[:effective_k]
+ 
+-    ranked = sorted(zip(jobs, scores), key=lambda pair: pair[1], reverse=True)
++    stage1_ranked_with_scores = sorted(zip(jobs, stage1_scores), key=lambda p: p[1], reverse=True)
++    stage1_ranked = [job for job, _ in stage1_ranked_with_scores]
++
++    if country_domain and enrich_limit > 0:
++        candidate_pool_size = max(effective_k, min(enrich_limit, len(stage1_ranked)))
++        candidate_pairs = stage1_ranked_with_scores[:candidate_pool_size]
++        candidates = [job for job, _ in candidate_pairs]
++        enriched_candidates = enrich_with_full_descriptions(
++            candidates, country_domain, limit=enrich_limit, status_callback=status_callback
++        )
++        stage2_scores, stage2_method = _rank(enriched_candidates, query)
++        if stage2_scores is not None:
++            ranked_pairs = sorted(zip(enriched_candidates, stage2_scores), key=lambda p: p[1], reverse=True)
++            method = stage2_method
++        else:
++            # Re-ranking failed for some reason - fall back to the stage-1
++            # scores for these same candidates rather than losing them.
++            ranked_pairs = candidate_pairs
++            method = stage1_method
++    else:
++        ranked_pairs = stage1_ranked_with_scores
++        method = stage1_method
+ 
+     results = []
+-    for job, score in ranked[:effective_k]:
++    for job, score in ranked_pairs[:effective_k]:
+         annotated = dict(job)
+         annotated["_relevance"] = round(float(score), 3)
+         annotated["_retrieval_method"] = method
++        annotated["_full_description_used"] = bool(job.get("full_description"))
+         results.append(annotated)
+     return results
+diff --git a/wire_client.py b/wire_client.py
+index ab026e4..be948ed 100644
+--- a/wire_client.py
++++ b/wire_client.py
+@@ -246,7 +246,7 @@ def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_doma
+     status_callback, if given, is passed through to run_action to
+     surface retry status (e.g. to a Streamlit spinner).
+ 
+-    Returns (jobs_list, used_live: bool, resolved_location: str).
++    Returns (jobs_list, used_live: bool, resolved_location: str, country_domain: str).
+     """
+     resolved = normalize_location_full(location)
+     location_str = resolved["location"]
+@@ -286,17 +286,35 @@ def search_jobs(query: str, location: str = "Bengaluru, Karnataka", country_doma
+             if jobs:
+                 location_str = fallback_location
+ 
+-    return jobs, True, location_str
++    return jobs, True, location_str, detected_country
+ 
+ 
+-def get_job_details(job_key: str = None, job_url: str = None, country_domain: str = "in"):
+-    """Get full details for one Indeed job (in_job_details, async)."""
++def get_job_details(
++    job_key: str = None,
++    job_url: str = None,
++    country_domain: str = "in",
++    max_wait_seconds: int = 60,
++    max_retries: int = 2,
++    retry_delay: float = 3.0,
++):
++    """
++    Get full details for one Indeed job (in_job_details, async).
++
++    max_wait_seconds/max_retries/retry_delay are exposed (rather than
++    hardcoded) so callers doing bulk enrichment - e.g. fetching full
++    descriptions for several postings to improve retrieval - can use a
++    tighter budget per call than a single one-off lookup would need,
++    since a slow detail fetch there should be skipped, not blocked on.
++    """
+     params = {"country_domain": country_domain}
+     if job_key:
+         params["job_key"] = job_key
+     if job_url:
+         params["job_url"] = job_url
+-    raw = run_action("in_job_details", params)
++    raw = run_action(
++        "in_job_details", params,
++        max_wait_seconds=max_wait_seconds, max_retries=max_retries, retry_delay=retry_delay,
++    )
+     return raw.get("data", {}).get("data", {}), True
+ 
+ 
+@@ -317,8 +335,8 @@ if __name__ == "__main__":
+         print(json.dumps(get_available_search_actions(), indent=2))
+     elif len(sys.argv) >= 2 and sys.argv[1] == "test":
+         loc = sys.argv[2] if len(sys.argv) > 2 else "Bangalore"
+-        jobs, ok, resolved = search_jobs("backend developer", loc)
+-        print(f"Resolved location: {resolved}")
++        jobs, ok, resolved, country = search_jobs("backend developer", loc)
++        print(f"Resolved location: {resolved} (country: {country})")
+         print(f"Got {len(jobs)} jobs. First one:")
+         print(json.dumps(jobs[0], indent=2) if jobs else "none")
+     else:
+-- 
+2.43.0

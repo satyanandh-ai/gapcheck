@@ -5,7 +5,7 @@ Indeed postings via Wire. Built for Anakin Blitz.
 """
 
 import streamlit as st
-from wire_client import search_jobs, WireError
+from wire_client import search_jobs, WireError, _is_transient_failure
 from analyzer import analyze_gap
 from location_normalizer import suggestions
 from skill_aliases import normalize_skills
@@ -322,7 +322,10 @@ if submitted:
                 st.markdown("_Nothing structured was extracted - your raw input will still be used as-is._")
 
         with st.status("Searching live Indeed postings via Wire...", expanded=False) as status:
-            jobs, live, resolved_location = search_jobs(target_role, location=location)
+            jobs, live, resolved_location, resolved_country = search_jobs(
+                target_role, location=location,
+                status_callback=lambda msg: status.update(label=msg),
+            )
             status.update(label="Found " + str(len(jobs)) + " live postings via Wire")
 
         st.markdown(
@@ -342,7 +345,11 @@ if submitted:
             st.stop()
 
         with st.status("Ranking postings by relevance to your skills...", expanded=False) as status:
-            ranked_jobs = retrieve_relevant_jobs(query_text, target_role, jobs, top_k=15)
+            ranked_jobs = retrieve_relevant_jobs(
+                query_text, target_role, jobs, top_k=15,
+                country_domain=resolved_country,
+                status_callback=lambda msg: status.update(label=msg),
+            )
             status.update(label="Selected " + str(len(ranked_jobs)) + " most relevant postings")
 
         with st.status("Analyzing your gap against real postings...", expanded=False) as status:
@@ -447,13 +454,21 @@ if submitted:
             for j in ranked_jobs:
                 relevance = j.get("_relevance")
                 relevance_str = " · relevance " + f"{relevance:.2f}" if relevance is not None else ""
+                full_desc_str = " · full description" if j.get("_full_description_used") else ""
                 st.markdown(
                     "- " + j.get("title", "") + " - " + j.get("company", "")
-                    + " (" + str(j.get("date_posted", "")) + ")" + relevance_str
+                    + " (" + str(j.get("date_posted", "")) + ")" + relevance_str + full_desc_str
                 )
 
     except WireError as e:
-        st.error("Wire API error: " + str(e))
+        if _is_transient_failure(str(e)):
+            st.error(
+                "Wire's live scraper couldn't reach Indeed right now, even after retrying. "
+                "This is usually temporary (Indeed rate-limiting the scraper) and typically "
+                "clears up within a few minutes — please try again shortly."
+            )
+        else:
+            st.error("Wire API error: " + str(e))
     except Exception as e:
         st.error("Something went wrong: " + str(e))
 

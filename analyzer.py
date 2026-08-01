@@ -28,9 +28,13 @@ You will be given:
    user's specific skills/role (see each posting's relevance_to_candidate
    score, 0-1 — higher means it's a closer match to this candidate). Each
    posting has a "job_index" - use this to cite postings, never restate
-   or invent a company name/URL yourself.
+   or invent a company name/URL yourself. Each posting's "description"
+   field is the FULL job description when "description_is_full" is
+   true, or just a short search-result preview when it's false - treat
+   full descriptions as more authoritative on specifics like required
+   years of experience, since a short preview may not mention them at all.
 Your job: compare what these real postings actually ask for (read the
-snippets carefully) against what the user says they know, and produce a
+descriptions carefully) against what the user says they know, and produce a
 gap analysis grounded in the actual postings, not generic advice. Weigh
 higher-relevance postings more heavily when deciding what's a "real" gap
 versus a one-off requirement from a single unusual posting.
@@ -94,12 +98,21 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
     index_to_job = {}
     for i, job in enumerate(relevant_postings):
         index_to_job[i] = job
+        # Prefer the full description (fetched by retrieval.py's
+        # enrichment stage) over the short search-result snippet when
+        # available - it's what the LLM should actually read the
+        # requirements from. Larger char budget since it's much richer
+        # text than a 2-line preview.
+        has_full = bool(job.get("full_description"))
+        source_text = job.get("full_description") or job.get("snippet")
+        char_budget = 3000 if has_full else 500
         trimmed_postings.append({
             "job_index": i,
             "title": job.get("title"),
             "company": job.get("company"),
             "location": job.get("location"),
-            "snippet": _strip_html(job.get("snippet"))[:500],
+            "description": _strip_html(source_text)[:char_budget],
+            "description_is_full": has_full,
             "url": job.get("url"),
             "relevance_to_candidate": job.get("_relevance"),
         })

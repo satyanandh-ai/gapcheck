@@ -117,7 +117,43 @@ def parse_profile(raw_text: str) -> dict:
     # schema exactly - downstream code shouldn't need defensive .get() everywhere.
     profile = dict(EMPTY_PROFILE)
     profile.update(parsed)
-    return profile
+    return _clean_profile(profile)
+
+
+def _clean_profile(profile: dict) -> dict:
+    """
+    Strips out blank/empty entries the LLM sometimes includes despite
+    the "never invent, leave it out if absent" instruction - e.g. a
+    projects list with 3 entries that all have empty name/description.
+    Left uncleaned, these render as blank bullet points in the UI and
+    add nothing (or noise) to the retrieval query text. This runs once,
+    here, so every consumer (the UI preview and profile_to_query_text)
+    sees already-clean data instead of each needing its own filtering.
+    """
+    skills = [s.strip() for s in (profile.get("skills") or []) if isinstance(s, str) and s.strip()]
+
+    projects = []
+    for p in profile.get("projects") or []:
+        if isinstance(p, dict):
+            name = (p.get("name") or "").strip()
+            desc = (p.get("description") or "").strip()
+            if name or desc:
+                projects.append({"name": name, "description": desc})
+        elif isinstance(p, str) and p.strip():
+            projects.append({"name": p.strip(), "description": ""})
+
+    certifications = [c.strip() for c in (profile.get("certifications") or []) if isinstance(c, str) and c.strip()]
+
+    years_experience = (profile.get("years_experience") or "").strip() or "not stated"
+    summary = (profile.get("summary") or "").strip()
+
+    return {
+        "skills": skills,
+        "projects": projects,
+        "certifications": certifications,
+        "years_experience": years_experience,
+        "summary": summary,
+    }
 
 
 def profile_to_query_text(profile: dict) -> str:

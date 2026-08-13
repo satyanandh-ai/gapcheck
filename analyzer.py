@@ -39,11 +39,33 @@ gap analysis grounded in the actual postings, not generic advice. Weigh
 higher-relevance postings more heavily when deciding what's a "real" gap
 versus a one-off requirement from a single unusual posting.
 
-Also produce a score_breakdown: a short list of the 4-6 most important
-skill/competency areas these postings actually ask for, each rated
-against what the user has. This is what makes match_score explainable
-instead of an unexplained number — a reader should be able to look at
-the breakdown and see exactly why the score is what it is.
+SCORING - this is a points-allocation exercise, not a number you invent:
+Produce a score_breakdown: the 4-6 most important skill/competency areas
+these postings actually ask for. For each area, assign "max_points" (how
+much this area matters to these postings, as a share of 100 - the
+max_points across ALL rows in score_breakdown MUST sum to exactly 100),
+and "achieved_points" (0 to max_points, how well the user's stated
+skills/experience support this specific area). The final match_score is
+NOT something you state directly - it is calculated afterward as the sum
+of achieved_points, so your job is only to allocate max_points sensibly
+across the areas that matter and score achieved_points honestly against
+each one.
+
+Keep areas distinct and non-overlapping - e.g. "MLOps" (experiment
+tracking, model registry, monitoring) and "Containerization" (Docker,
+Kubernetes) are different things even if related; don't create two rows
+that would both be satisfied or both be missing by the same evidence.
+
+BE STRICT ABOUT SOFT/INTERPERSONAL SKILLS (communication, teamwork,
+leadership, stakeholder management, collaboration): only award
+achieved_points > 0 if the user's stated profile EXPLICITLY mentions
+something like leading a team, presenting to stakeholders, mentoring,
+open-source contribution, or similar. Having built individual technical
+projects is NOT evidence of collaboration or communication ability -
+don't infer soft skills from the mere existence of projects. If there's
+no explicit evidence, achieved_points must be 0 and the note should say
+so plainly (e.g. "No direct evidence of team collaboration in your
+profile - projects alone don't demonstrate this").
 
 CITATIONS - this is critical for trust: every score_breakdown row and
 every gap MUST include a "cited_job_indices" field - a list of the
@@ -56,10 +78,9 @@ actually support the claim.
 
 Respond ONLY with valid JSON, no markdown fences, no preamble, in this exact shape:
 {
-  "match_score": <integer 0-100>,
   "summary": "<one or two blunt sentences on overall readiness, referencing real postings>",
   "score_breakdown": [
-    {"area": "<skill/competency area drawn from real postings>", "status": "<strong|partial|missing>", "note": "<one short clause explaining the rating>", "cited_job_indices": [<job_index>, ...] (use [] if none apply)}
+    {"area": "<skill/competency area drawn from real postings>", "max_points": <int, all rows sum to 100>, "achieved_points": <int, 0 to max_points>, "note": "<one short clause explaining the rating>", "cited_job_indices": [<job_index>, ...] (use [] if none apply)}
   ],
   "strengths": ["<skill the user has that these postings actually want>", ...],
   "gaps": [
@@ -70,13 +91,17 @@ Respond ONLY with valid JSON, no markdown fences, no preamble, in this exact sha
   ],
   "matching_job_indices": [<job_index>, <job_index>, <job_index>]
 }
-Keep gaps to the 3-5 that matter most. Keep score_breakdown to 4-6 areas —
-these should be the areas that most influenced the match_score, not an
-exhaustive list. For matching_job_indices, pick up to 3 job_index values
-for postings that best fit the user's current level. Be specific —
-reference real requirements from the postings provided, not generic
-advice. Time estimates should be realistic for someone learning
-part-time alongside other commitments, not idealized."""
+Keep gaps to the 3-5 that matter most, and don't create multiple overlapping
+gaps for essentially the same underlying skill (e.g. "MLOps", "model
+deployment", and "containerization" as three separate gaps when they're
+really one gap with several parts - consolidate). Keep score_breakdown to
+4-6 areas - these should be the areas that most influenced the score, not
+an exhaustive list, and their max_points must sum to exactly 100. For
+matching_job_indices, pick up to 3 job_index values for postings that best
+fit the user's current level. Be specific — reference real requirements
+from the postings provided, not generic advice. Time estimates should be
+realistic for someone learning part-time alongside other commitments, not
+idealized."""
 def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
     """Calls Groq LLM to compare user skills vs real job postings."""
     if not GROQ_API_KEY:
@@ -141,18 +166,87 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
 
 def _evidence_tier(coverage_pct: float, cited_count: int) -> str:
     """
-    Buckets citation coverage into a human-readable tier. Deliberately
-    called "evidence strength", not "confidence" - this reflects how
-    much of the retrieved posting set backs the claim, not the LLM's
-    certainty, which isn't something we can actually measure.
+    Buckets citation coverage into a human-readable tier - i.e. how
+    much of the retrieved posting set backs a claim, NOT the
+    candidate's skill level (that's `status`, derived separately from
+    points). Deliberately uses different words than status's
+    strong/partial/missing (well_supported/some_support/limited_
+    support/unsupported) - both scales used "strong"/"moderate"
+    independently, which read as two disagreeing judgments about the
+    same thing when shown together, even though they measure
+    different things (citation coverage vs. candidate skill level).
     """
     if cited_count == 0:
         return "unsupported"
     if coverage_pct >= 50:
-        return "strong"
+        return "well_supported"
     if coverage_pct >= 20:
-        return "moderate"
-    return "limited"
+        return "some_support"
+    return "limited_support"
+
+
+def _status_from_points(achieved: int, max_points: int) -> str:
+    """
+    Derives the strong/partial/missing badge from the achieved/max
+    points ratio, rather than asking the LLM to separately state both
+    a score AND a status label for the same row - two independently
+    asserted numbers can disagree with each other (e.g. "7/10 points"
+    next to a "missing" badge), which is exactly the kind of
+    inconsistency this whole citation/scoring system exists to avoid.
+    Deriving status from the same numbers that produce the score
+    guarantees they can never contradict each other.
+    """
+    if max_points <= 0:
+        return "missing"
+    ratio = achieved / max_points
+    if ratio >= 0.7:
+        return "strong"
+    if ratio >= 0.35:
+        return "partial"
+    return "missing"
+
+
+def _normalize_score_breakdown(score_breakdown: list) -> list:
+    """
+    Validates and cleans the LLM's max_points/achieved_points per row:
+    coerces to int, clips achieved_points to [0, max_points] (an LLM
+    claiming more achieved than max is a contradiction we shouldn't
+    display), and drops rows with a non-positive max_points (can't
+    compute a meaningful ratio or weight from those). Never raises -
+    malformed rows are dropped rather than crashing the whole analysis.
+    """
+    cleaned = []
+    for row in score_breakdown or []:
+        try:
+            max_points = int(row.get("max_points", 0))
+            achieved_points = int(row.get("achieved_points", 0))
+        except (TypeError, ValueError):
+            continue
+        if max_points <= 0:
+            continue
+        achieved_points = max(0, min(achieved_points, max_points))
+        row["max_points"] = max_points
+        row["achieved_points"] = achieved_points
+        cleaned.append(row)
+    return cleaned
+
+
+def _compute_match_score(score_breakdown: list) -> int:
+    """
+    The match_score is calculated here, in code, as a percentage of
+    points actually achieved - it is never taken from a number the LLM
+    states directly. The prompt asks the LLM to make max_points across
+    rows sum to 100, but this doesn't hard-require that: it computes
+    achieved/max as a genuine percentage regardless of what the row
+    totals actually sum to, so a model that doesn't follow the "sum to
+    100" instruction exactly still produces a mathematically honest
+    score instead of a silently wrong one.
+    """
+    total_max = sum(row["max_points"] for row in score_breakdown)
+    total_achieved = sum(row["achieved_points"] for row in score_breakdown)
+    if total_max <= 0:
+        return 0
+    return round(100 * total_achieved / total_max)
 
 
 def _citation_summary(indices: list, index_to_job: dict) -> dict:
@@ -203,15 +297,27 @@ def _citation_summary(indices: list, index_to_job: dict) -> dict:
 
 def _resolve_citations(parsed: dict, index_to_job: dict) -> dict:
     """
-    Post-processes the LLM's raw JSON: replaces job_index citation
-    lists with real posting data (title/company/url) sourced from our
-    own retrieval results, and rebuilds matching_jobs from
-    matching_job_indices the same way - so no company name or URL in
-    the final response was ever generated by the LLM itself.
+    Post-processes the LLM's raw JSON:
+      - normalizes score_breakdown's max_points/achieved_points and
+        computes match_score from them in code (see _compute_match_score) -
+        the LLM never states match_score directly, so there's no way
+        for a headline number to disagree with its own breakdown
+      - derives each row's status (strong/partial/missing) from that
+        same achieved/max ratio instead of trusting a separately
+        LLM-asserted label
+      - replaces job_index citation lists with real posting data
+        (title/company/url) sourced from our own retrieval results,
+        and rebuilds matching_jobs from matching_job_indices the same
+        way - so no company name or URL in the final response was
+        ever generated by the LLM itself
     """
     total = len(index_to_job)
 
-    for row in parsed.get("score_breakdown", []) or []:
+    parsed["score_breakdown"] = _normalize_score_breakdown(parsed.get("score_breakdown", []))
+    parsed["match_score"] = _compute_match_score(parsed["score_breakdown"])
+
+    for row in parsed["score_breakdown"]:
+        row["status"] = _status_from_points(row["achieved_points"], row["max_points"])
         summary = _citation_summary(row.pop("cited_job_indices", []), index_to_job)
         row["citations"] = summary["citations"]
         row["cited_count"] = summary["cited_count"]

@@ -212,10 +212,14 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 def citation_line(item: dict) -> str:
     """
-    Builds the evidence line for a score_breakdown row or gap, from
-    the trusted citation data analyzer.py attached (never from
-    LLM-generated text) - e.g. "Strong evidence - 4 of 8 retrieved
-    postings (50%) - Google, Nvidia".
+    Builds the citation-coverage line for a score_breakdown row or gap,
+    from the trusted citation data analyzer.py attached (never from
+    LLM-generated text) - e.g. "Cited in 4 of 8 retrieved postings
+    (50%) - Google, Nvidia". Deliberately doesn't use "strong"/
+    "moderate" wording here (that's `status`, a different measurement -
+    the candidate's skill level, derived from points) to avoid the two
+    independently-labeled scales reading as contradicting each other
+    when shown next to one another.
     """
     citations = item.get("citations") or []
     if not citations:
@@ -230,11 +234,12 @@ def citation_line(item: dict) -> str:
         company_str += f" +{len(companies) - 4} more"
 
     tier_labels = {
-        "strong": "Strong evidence",
-        "moderate": "Moderate evidence",
-        "limited": "Limited evidence",
+        "well_supported": "Well-supported",
+        "some_support": "Some support",
+        "limited_support": "Limited support",
+        "unsupported": "No citations",
     }
-    tier = tier_labels.get(item.get("evidence_tier"), "Evidence")
+    tier = tier_labels.get(item.get("evidence_tier"), "Citation coverage")
 
     total = item.get("cited_total")
     count = item.get("cited_count", len(citations))
@@ -368,9 +373,11 @@ if submitted:
 
         st.markdown(
             '<div class="gc-score-card">'
-            '<div class="gc-score-label">MATCH SCORE &middot; ' + target_role.upper() + '</div>'
+            '<div class="gc-score-label">REQUIREMENT-ALIGNMENT SCORE &middot; ' + target_role.upper() + '</div>'
             '<div class="gc-score-number" style="color:' + score_color + ';">' + str(score) + '<span>/100</span></div>'
             '<div class="gc-score-summary">' + result.get("summary", "") + '</div>'
+            '<div class="gc-citation">Measures alignment between your stated skills and the requirements found '
+            'in the retrieved postings. Not a prediction of job-readiness, interview performance, or hiring outcome.</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -382,7 +389,10 @@ if submitted:
                 status = b.get("status", "partial").lower()
                 if status not in ("strong", "partial", "missing"):
                     status = "partial"
-                note_html = '<div class="gc-breakdown-note">' + b.get("note", "") + '</div>'
+                points_str = ""
+                if b.get("max_points") is not None and b.get("achieved_points") is not None:
+                    points_str = f" &middot; {b['achieved_points']}/{b['max_points']} pts"
+                note_html = '<div class="gc-breakdown-note">' + b.get("note", "") + points_str + '</div>'
                 cite = citation_line(b)
                 if cite:
                     note_html += '<div class="gc-citation">' + cite + '</div>'

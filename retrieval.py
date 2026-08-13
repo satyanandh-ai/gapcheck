@@ -27,16 +27,22 @@ fetches run concurrently with a bounded worker pool, and any individual
 failure or slow response just leaves that one posting on its snippet -
 degrading gracefully rather than blocking the whole search.
 
-Two ranking strategies, in priority order, used at both stages:
+Ranking is hybrid, used at both stages:
 
-1. Semantic (OpenAI text-embedding-3-small), if OPENAI_API_KEY is set.
-   Understands "React" ~= "frontend framework", "GCP" ~= "Google Cloud"
-   even without literal keyword overlap - TF-IDF can't do that.
-2. TF-IDF + cosine similarity, as a zero-dependency, zero-API-key
-   fallback. Used automatically if no embedding key is configured, or
-   if the embedding API call fails for any reason (network issue, rate
-   limit, bad key) - a broken *upgrade* should never break the basic
-   gap-check.
+- TF-IDF + cosine similarity (keyword matching) - always computed,
+  zero-dependency, zero-API-key. Reliable for exact terms: tool names,
+  acronyms, specific technologies like "Docker" or "AWS".
+- Semantic (OpenAI text-embedding-3-small), if OPENAI_API_KEY is set -
+  catches paraphrases keyword matching can't: "React" ~= "frontend
+  framework", "GCP" ~= "Google Cloud".
+
+When both are available, scores are min-max normalized and combined
+(weighted toward semantic, see HYBRID_SEMANTIC_WEIGHT) - semantic
+matching alone can dilute exact-term signal, so keeping a real keyword
+contribution avoids losing precision on the specific tools/acronyms
+that TF-IDF is naturally strong at. No OPENAI_API_KEY, or the embedding
+call fails for any reason (network issue, rate limit, bad key) -> pure
+TF-IDF, so a broken *upgrade* never breaks the basic gap-check.
 
 All of this is query-time retrieval over a small, per-request corpus
 (the postings Wire just returned for this one search) - no persistent
@@ -161,24 +167,70 @@ def _rank_by_tfidf(documents: list, query: str):
         return None
 
 
+# Weight given to the semantic (embeddings) score vs. the keyword
+# (TF-IDF) score when both are available. Semantic matching catches
+# paraphrases TF-IDF can't ("LLM application development" ~=
+# "Generative AI development"), but exact terms - tool names, acronyms,
+# specific technologies like "Docker" or "AWS" - are exactly what
+# keyword matching is reliable at and embeddings can sometimes dilute.
+# Weighting toward semantic (0.6) but keeping a real keyword
+# contribution (0.4) gets both signals instead of picking one.
+HYBRID_SEMANTIC_WEIGHT = 0.6
+
+
+def _minmax_normalize(scores):
+    """
+    Scales a score array to [0, 1]. TF-IDF cosine similarities and
+    embedding cosine similarities live on different scales (embedding
+    similarities for short texts are often bunched in a narrow high
+    range, e.g. 0.7-0.95, while TF-IDF is typically much lower and more
+    spread out) - combining them without normalizing first would let
+    whichever scale happens to be larger silently dominate the blend
+    regardless of the intended weight.
+    """
+    scores = np.array(scores, dtype=float)
+    lo, hi = scores.min(), scores.max()
+    if hi - lo < 1e-9:
+        # every job scored identically - nothing to normalize, avoid
+        # a divide-by-zero and just treat them as equally (ir)relevant
+        return np.zeros_like(scores)
+    return (scores - lo) / (hi - lo)
+
+
 def _rank(jobs: list, query: str):
     """
-    Scores `jobs` against `query`, embeddings-first with a TF-IDF
-    fallback (see module docstring). Returns (scores, method) where
-    method is "embeddings" or "tfidf". Never raises - if both ranking
-    strategies fail (e.g. empty vocabulary), returns (None, "none")
-    and the caller should treat the input order as unranked.
+    Scores `jobs` against `query` using hybrid retrieval: TF-IDF
+    (keyword) and, if OPENAI_API_KEY is set, semantic embeddings,
+    combined via HYBRID_SEMANTIC_WEIGHT after min-max normalizing each
+    to a comparable [0, 1] scale. Returns (scores, method):
+      - "hybrid" - both signals combined
+      - "tfidf"  - no embedding key configured, or the embedding call
+                   failed - keyword-only, exactly today's fallback behavior
+      - "none"   - both ranking strategies failed (e.g. empty vocabulary
+                   AND no embeddings available); caller should treat
+                   the input as unranked
+
+    Never raises - a broken ranking step should never break retrieval.
     """
     documents = [_job_to_document(j) for j in jobs]
 
-    if OPENAI_API_KEY:
-        scores = _rank_by_embeddings(documents, query)
-        if scores is not None:
-            return scores, "embeddings"
+    tfidf_scores = _rank_by_tfidf(documents, query)
 
-    scores = _rank_by_tfidf(documents, query)
-    if scores is not None:
-        return scores, "tfidf"
+    if OPENAI_API_KEY:
+        embedding_scores = _rank_by_embeddings(documents, query)
+        if embedding_scores is not None:
+            if tfidf_scores is not None:
+                combined = (
+                    HYBRID_SEMANTIC_WEIGHT * _minmax_normalize(embedding_scores)
+                    + (1 - HYBRID_SEMANTIC_WEIGHT) * _minmax_normalize(tfidf_scores)
+                )
+                return combined, "hybrid"
+            # TF-IDF failed (e.g. empty vocabulary) but embeddings worked -
+            # semantic-only is still better than nothing.
+            return embedding_scores, "embeddings"
+
+    if tfidf_scores is not None:
+        return tfidf_scores, "tfidf"
 
     return None, "none"
 
@@ -272,8 +324,9 @@ def retrieve_relevant_jobs(
     Ranks `jobs` (raw postings from wire_client.search_jobs) by
     relevance to the user's skills + target role, and returns the
     top_k most relevant postings, each annotated with:
-      - `_relevance`: cosine similarity score against the query
-      - `_retrieval_method`: "embeddings" or "tfidf", whichever ranked it
+      - `_relevance`: similarity score against the query (0-1)
+      - `_retrieval_method`: "hybrid", "embeddings", or "tfidf" -
+        whichever combination actually ranked it (see _rank)
       - `_full_description_used`: True if this posting's ranking (and
         the text sent to the LLM) is based on the full description,
         not just the short snippet

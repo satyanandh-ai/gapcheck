@@ -446,7 +446,12 @@ if submitted:
                 )
 
         retrieval_method = ranked_jobs[0].get("_retrieval_method", "tfidf") if ranked_jobs else "tfidf"
-        method_label = "semantic embeddings" if retrieval_method == "embeddings" else "TF-IDF (keyword)"
+        method_labels = {
+            "hybrid": "hybrid: keyword + semantic",
+            "embeddings": "semantic embeddings",
+            "tfidf": "TF-IDF (keyword)",
+        }
+        method_label = method_labels.get(retrieval_method, "TF-IDF (keyword)")
         with st.expander(
             "Raw data: " + str(len(jobs)) + " live postings pulled via Wire, "
             "top " + str(len(ranked_jobs)) + " used for analysis (ranked by " + method_label + ")"

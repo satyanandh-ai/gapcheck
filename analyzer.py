@@ -39,17 +39,25 @@ gap analysis grounded in the actual postings, not generic advice. Weigh
 higher-relevance postings more heavily when deciding what's a "real" gap
 versus a one-off requirement from a single unusual posting.
 
-SCORING - this is a points-allocation exercise, not a number you invent:
-Produce a score_breakdown: the 4-6 most important skill/competency areas
-these postings actually ask for. For each area, assign "max_points" (how
-much this area matters to these postings, as a share of 100 - the
-max_points across ALL rows in score_breakdown MUST sum to exactly 100),
-and "achieved_points" (0 to max_points, how well the user's stated
-skills/experience support this specific area). The final match_score is
-NOT something you state directly - it is calculated afterward as the sum
-of achieved_points, so your job is only to allocate max_points sensibly
-across the areas that matter and score achieved_points honestly against
-each one.
+NEVER reference a posting by its job_index, or say things like "postings
+0, 1, and 2" or "job posting 3", anywhere in free text (summary, note,
+why_it_matters, how_to_fix, action). job_index is an internal identifier
+for the cited_job_indices field only - readers should never see it. If
+you want to reference postings in prose, describe them qualitatively
+instead (e.g. "several retrieved postings emphasize cloud deployment").
+
+SCORING: produce a score_breakdown - the 4-6 most important skill/
+competency areas these postings actually ask for. For each area, judge
+ONLY how strongly the user's stated skills/experience support it, as
+"evidence_pct" (0-100). Do NOT judge how important or common this area
+is in the job market yourself - that's calculated separately from which
+postings you cite, using the SAME cited_job_indices you provide for that
+row, not something you need to weigh in evidence_pct. Keeping these
+separate matters: a skill you rate highly just because the user is good
+at it, but that few of the retrieved postings actually ask for, should
+not end up dominating the final score - and it won't, as long as you
+score evidence_pct purely on evidence strength and let citations do the
+market-relevance work.
 
 Keep areas distinct and non-overlapping - e.g. "MLOps" (experiment
 tracking, model registry, monitoring) and "Containerization" (Docker,
@@ -58,14 +66,14 @@ that would both be satisfied or both be missing by the same evidence.
 
 BE STRICT ABOUT SOFT/INTERPERSONAL SKILLS (communication, teamwork,
 leadership, stakeholder management, collaboration): only award
-achieved_points > 0 if the user's stated profile EXPLICITLY mentions
+evidence_pct > 0 if the user's stated profile EXPLICITLY mentions
 something like leading a team, presenting to stakeholders, mentoring,
 open-source contribution, or similar. Having built individual technical
 projects is NOT evidence of collaboration or communication ability -
 don't infer soft skills from the mere existence of projects. If there's
-no explicit evidence, achieved_points must be 0 and the note should say
-so plainly (e.g. "No direct evidence of team collaboration in your
-profile - projects alone don't demonstrate this").
+no explicit evidence, evidence_pct must be 0 and the note should say so
+plainly (e.g. "No direct evidence of team collaboration in your profile
+- projects alone don't demonstrate this").
 
 CITATIONS - this is critical for trust: every score_breakdown row and
 every gap MUST include a "cited_job_indices" field - a list of the
@@ -74,13 +82,16 @@ contain or imply that requirement. This field is required on every
 row, with no exceptions: if you genuinely cannot point to a specific
 posting for something, use an empty list "cited_job_indices": [] -
 never omit the field, and never pad it with postings that don't
-actually support the claim.
+actually support the claim. For score_breakdown rows specifically,
+these citations also determine how much that area counts toward the
+final score - an accurate, non-padded citation list matters as much
+here as it does for trust.
 
 Respond ONLY with valid JSON, no markdown fences, no preamble, in this exact shape:
 {
-  "summary": "<one or two blunt sentences on overall readiness, referencing real postings>",
+  "summary": "<one or two blunt sentences on overall readiness, referencing real postings qualitatively - never by job_index or number>",
   "score_breakdown": [
-    {"area": "<skill/competency area drawn from real postings>", "max_points": <int, all rows sum to 100>, "achieved_points": <int, 0 to max_points>, "note": "<one short clause explaining the rating>", "cited_job_indices": [<job_index>, ...] (use [] if none apply)}
+    {"area": "<skill/competency area drawn from real postings>", "evidence_pct": <int 0-100, evidence strength ONLY>, "note": "<one short clause explaining the rating>", "cited_job_indices": [<job_index>, ...] (use [] if none apply)}
   ],
   "strengths": ["<skill the user has that these postings actually want>", ...],
   "gaps": [
@@ -96,12 +107,11 @@ gaps for essentially the same underlying skill (e.g. "MLOps", "model
 deployment", and "containerization" as three separate gaps when they're
 really one gap with several parts - consolidate). Keep score_breakdown to
 4-6 areas - these should be the areas that most influenced the score, not
-an exhaustive list, and their max_points must sum to exactly 100. For
-matching_job_indices, pick up to 3 job_index values for postings that best
-fit the user's current level. Be specific — reference real requirements
-from the postings provided, not generic advice. Time estimates should be
-realistic for someone learning part-time alongside other commitments, not
-idealized."""
+an exhaustive list. For matching_job_indices, pick up to 3 job_index values
+for postings that best fit the user's current level. Be specific —
+reference real requirements from the postings provided, not generic
+advice. Time estimates should be realistic for someone learning
+part-time alongside other commitments, not idealized."""
 def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
     """Calls Groq LLM to compare user skills vs real job postings."""
     if not GROQ_API_KEY:
@@ -164,89 +174,114 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
     return _resolve_citations(parsed, index_to_job)
 
 
-def _evidence_tier(coverage_pct: float, cited_count: int) -> str:
+def _market_demand_tier(market_demand_pct: float, cited_count: int) -> str:
     """
-    Buckets citation coverage into a human-readable tier - i.e. how
-    much of the retrieved posting set backs a claim, NOT the
-    candidate's skill level (that's `status`, derived separately from
-    points). Deliberately uses different words than status's
-    strong/partial/missing (well_supported/some_support/limited_
-    support/unsupported) - both scales used "strong"/"moderate"
-    independently, which read as two disagreeing judgments about the
-    same thing when shown together, even though they measure
-    different things (citation coverage vs. candidate skill level).
+    Buckets citation coverage - i.e. how much of the retrieved posting
+    set actually asks for this - into a human-readable tier. This is
+    ONLY about the market (computed from citations), never about the
+    candidate's own skill level (that's `status`, derived separately
+    from evidence_pct) - keeping the words distinct (well_supported/
+    some_support/limited_support/unsupported vs. strong/good/partial/
+    weak/not_demonstrated) avoids the two independent measurements
+    reading as if they're contradicting each other when shown together.
     """
     if cited_count == 0:
         return "unsupported"
-    if coverage_pct >= 50:
+    if market_demand_pct >= 50:
         return "well_supported"
-    if coverage_pct >= 20:
+    if market_demand_pct >= 20:
         return "some_support"
     return "limited_support"
 
 
-def _status_from_points(achieved: int, max_points: int) -> str:
+def _priority_from_market_demand(market_demand_pct: float) -> str:
     """
-    Derives the strong/partial/missing badge from the achieved/max
-    points ratio, rather than asking the LLM to separately state both
-    a score AND a status label for the same row - two independently
-    asserted numbers can disagree with each other (e.g. "7/10 points"
-    next to a "missing" badge), which is exactly the kind of
-    inconsistency this whole citation/scoring system exists to avoid.
-    Deriving status from the same numbers that produce the score
-    guarantees they can never contradict each other.
+    Derives a gap's priority (high/medium/low) from how many retrieved
+    postings actually cite it - not from how severe or generic the gap
+    sounds. A gap mentioned in most retrieved postings deserves more
+    attention than one that showed up in a single unusual listing,
+    even if both are framed similarly in prose.
     """
-    if max_points <= 0:
-        return "missing"
-    ratio = achieved / max_points
-    if ratio >= 0.7:
+    if market_demand_pct >= 50:
+        return "high"
+    if market_demand_pct >= 20:
+        return "medium"
+    return "low"
+
+
+def _status_from_evidence(evidence_pct: int) -> str:
+    """
+    Buckets evidence_pct (the LLM's evidence-strength judgment, 0-100)
+    into a 5-tier label. This measures candidate evidence only - how
+    strongly the profile supports this area - not market demand, which
+    is a separate, code-computed number (see market_demand_pct below).
+
+    The exact cutoffs (80/60/30/1) are a judgment call, not a derived
+    fact - there's no ground truth that makes 80% "the" boundary for
+    Strong vs. 75% or 85%. Adopted as specified rather than re-derived.
+    """
+    if evidence_pct >= 80:
         return "strong"
-    if ratio >= 0.35:
+    if evidence_pct >= 60:
+        return "good"
+    if evidence_pct >= 30:
         return "partial"
-    return "missing"
+    if evidence_pct >= 1:
+        return "weak"
+    return "not_demonstrated"
 
 
 def _normalize_score_breakdown(score_breakdown: list) -> list:
     """
-    Validates and cleans the LLM's max_points/achieved_points per row:
-    coerces to int, clips achieved_points to [0, max_points] (an LLM
-    claiming more achieved than max is a contradiction we shouldn't
-    display), and drops rows with a non-positive max_points (can't
-    compute a meaningful ratio or weight from those). Never raises -
-    malformed rows are dropped rather than crashing the whole analysis.
+    Validates and cleans the LLM's evidence_pct per row: coerces to
+    int, clips to [0, 100] (defends against an out-of-range or
+    malformed value), and drops rows that are missing an area name
+    entirely. Never raises - malformed rows are dropped rather than
+    crashing the whole analysis.
     """
     cleaned = []
     for row in score_breakdown or []:
+        if not row.get("area"):
+            continue
         try:
-            max_points = int(row.get("max_points", 0))
-            achieved_points = int(row.get("achieved_points", 0))
+            evidence_pct = int(row.get("evidence_pct", 0))
         except (TypeError, ValueError):
-            continue
-        if max_points <= 0:
-            continue
-        achieved_points = max(0, min(achieved_points, max_points))
-        row["max_points"] = max_points
-        row["achieved_points"] = achieved_points
+            evidence_pct = 0
+        row["evidence_pct"] = max(0, min(evidence_pct, 100))
         cleaned.append(row)
     return cleaned
 
 
 def _compute_match_score(score_breakdown: list) -> int:
     """
-    The match_score is calculated here, in code, as a percentage of
-    points actually achieved - it is never taken from a number the LLM
-    states directly. The prompt asks the LLM to make max_points across
-    rows sum to 100, but this doesn't hard-require that: it computes
-    achieved/max as a genuine percentage regardless of what the row
-    totals actually sum to, so a model that doesn't follow the "sum to
-    100" instruction exactly still produces a mathematically honest
-    score instead of a silently wrong one.
+    match_score is calculated here, in code, as a market-demand-
+    weighted average of evidence_pct - never a number the LLM states
+    directly, and never a simple unweighted average either.
+
+    Each row's weight is its market_demand_pct (how many of the
+    retrieved postings actually cite it - computed from the SAME
+    cited_job_indices the LLM already provides, not a separate
+    LLM-assigned "importance"). This is the fix for a real problem:
+    previously the LLM could call a skill "20/20 important" while the
+    citation data showed only 5 of 15 postings actually required it -
+    two independently-asserted numbers with no relationship to each
+    other. Now importance isn't asserted at all; it's measured from
+    the same evidence used everywhere else in the app. A skill the
+    candidate is strong in but that almost nothing in the retrieved
+    market actually asks for can no longer dominate the score.
+
+    Falls back to an unweighted average if every row's market_demand_pct
+    is 0 (e.g. citation resolution failed across the board) - otherwise
+    a total-weight of zero would make the score meaningless rather than
+    just imperfectly weighted.
     """
-    total_max = sum(row["max_points"] for row in score_breakdown)
-    total_achieved = sum(row["achieved_points"] for row in score_breakdown)
-    if total_max <= 0:
+    if not score_breakdown:
         return 0
-    return round(100 * total_achieved / total_max)
+    total_weight = sum(row["market_demand_pct"] for row in score_breakdown)
+    if total_weight <= 0:
+        return round(sum(row["evidence_pct"] for row in score_breakdown) / len(score_breakdown))
+    weighted_sum = sum(row["market_demand_pct"] * row["evidence_pct"] for row in score_breakdown)
+    return round(weighted_sum / total_weight)
 
 
 def _citation_summary(indices: list, index_to_job: dict) -> dict:
@@ -284,27 +319,31 @@ def _citation_summary(indices: list, index_to_job: dict) -> dict:
             relevance_scores.append(job["_relevance"])
     total = len(index_to_job)
     cited_count = len(citations)
-    coverage_pct = round(100 * cited_count / total) if total else 0
+    market_demand_pct = round(100 * cited_count / total) if total else 0
     avg_relevance = round(sum(relevance_scores) / len(relevance_scores), 3) if relevance_scores else None
     return {
         "citations": citations,
         "avg_relevance": avg_relevance,
         "cited_count": cited_count,
-        "coverage_pct": coverage_pct,
-        "evidence_tier": _evidence_tier(coverage_pct, cited_count),
+        "market_demand_pct": market_demand_pct,
+        "market_demand_tier": _market_demand_tier(market_demand_pct, cited_count),
     }
 
 
 def _resolve_citations(parsed: dict, index_to_job: dict) -> dict:
     """
     Post-processes the LLM's raw JSON:
-      - normalizes score_breakdown's max_points/achieved_points and
-        computes match_score from them in code (see _compute_match_score) -
-        the LLM never states match_score directly, so there's no way
-        for a headline number to disagree with its own breakdown
-      - derives each row's status (strong/partial/missing) from that
-        same achieved/max ratio instead of trusting a separately
-        LLM-asserted label
+      - resolves each score_breakdown row's citations FIRST (needed to
+        compute market_demand_pct before the score can be calculated)
+      - computes match_score in code as a market-demand-weighted
+        average of evidence_pct (see _compute_match_score) - market
+        weight comes from citations, not an LLM-asserted importance
+      - derives each row's status (strong/good/partial/weak/not_
+        demonstrated) from evidence_pct alone, so it can never
+        contradict the number driving the score
+      - derives each gap's priority (high/medium/low) from how many
+        retrieved postings actually cite it, not from how the gap is
+        phrased
       - replaces job_index citation lists with real posting data
         (title/company/url) sourced from our own retrieval results,
         and rebuilds matching_jobs from matching_job_indices the same
@@ -314,26 +353,34 @@ def _resolve_citations(parsed: dict, index_to_job: dict) -> dict:
     total = len(index_to_job)
 
     parsed["score_breakdown"] = _normalize_score_breakdown(parsed.get("score_breakdown", []))
-    parsed["match_score"] = _compute_match_score(parsed["score_breakdown"])
 
     for row in parsed["score_breakdown"]:
-        row["status"] = _status_from_points(row["achieved_points"], row["max_points"])
         summary = _citation_summary(row.pop("cited_job_indices", []), index_to_job)
         row["citations"] = summary["citations"]
         row["cited_count"] = summary["cited_count"]
         row["cited_total"] = total
-        row["coverage_pct"] = summary["coverage_pct"]
-        row["evidence_tier"] = summary["evidence_tier"]
+        row["market_demand_pct"] = summary["market_demand_pct"]
+        row["market_demand_tier"] = summary["market_demand_tier"]
         row["avg_relevance"] = summary["avg_relevance"]
+        row["status"] = _status_from_evidence(row["evidence_pct"])
+
+    parsed["match_score"] = _compute_match_score(parsed["score_breakdown"])
 
     for gap in parsed.get("gaps", []) or []:
         summary = _citation_summary(gap.pop("cited_job_indices", []), index_to_job)
         gap["citations"] = summary["citations"]
         gap["cited_count"] = summary["cited_count"]
         gap["cited_total"] = total
-        gap["coverage_pct"] = summary["coverage_pct"]
-        gap["evidence_tier"] = summary["evidence_tier"]
+        gap["market_demand_pct"] = summary["market_demand_pct"]
+        gap["market_demand_tier"] = summary["market_demand_tier"]
         gap["avg_relevance"] = summary["avg_relevance"]
+        gap["priority"] = _priority_from_market_demand(summary["market_demand_pct"])
+
+    # Gaps are shown in priority order - the reader's attention should
+    # go to what the retrieved market actually demands most, not
+    # whatever order the LLM happened to list them in.
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    parsed["gaps"] = sorted(parsed.get("gaps", []) or [], key=lambda g: priority_rank.get(g["priority"], 3))
 
     matching_indices = parsed.pop("matching_job_indices", []) or []
     matching_jobs = []

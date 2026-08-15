@@ -162,8 +162,13 @@ div[data-testid="stForm"] label { color: #C9C6C0 !important; font-size: 0.88rem 
     margin-left: 1rem;
 }
 .gc-status-strong { background: rgba(122, 200, 150, 0.12); border: 1px solid rgba(122, 200, 150, 0.35); color: #9FDDB4; }
+.gc-status-good { background: rgba(154, 200, 122, 0.12); border: 1px solid rgba(154, 200, 122, 0.35); color: #C3DD9F; }
 .gc-status-partial { background: rgba(255, 154, 107, 0.12); border: 1px solid rgba(255, 154, 107, 0.35); color: #FF9A6B; }
-.gc-status-missing { background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35); color: #FF6B6B; }
+.gc-status-weak { background: rgba(255, 130, 90, 0.12); border: 1px solid rgba(255, 130, 90, 0.35); color: #FFA37D; }
+.gc-status-missing, .gc-status-not_demonstrated { background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35); color: #FF6B6B; }
+.gc-priority-high { background: rgba(255, 107, 107, 0.12); border: 1px solid rgba(255, 107, 107, 0.35); color: #FF6B6B; }
+.gc-priority-medium { background: rgba(255, 154, 107, 0.12); border: 1px solid rgba(255, 154, 107, 0.35); color: #FF9A6B; }
+.gc-priority-low { background: rgba(154, 152, 148, 0.12); border: 1px solid rgba(154, 152, 148, 0.35); color: #A8A5A0; }
 .gc-time-badge {
     font-family: 'JetBrains Mono', monospace;
     font-size: 0.74rem;
@@ -210,16 +215,20 @@ div[data-testid="stExpander"] {
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
-def citation_line(item: dict) -> str:
+def market_demand_line(item: dict) -> str:
     """
-    Builds the citation-coverage line for a score_breakdown row or gap,
-    from the trusted citation data analyzer.py attached (never from
-    LLM-generated text) - e.g. "Cited in 4 of 8 retrieved postings
-    (50%) - Google, Nvidia". Deliberately doesn't use "strong"/
-    "moderate" wording here (that's `status`, a different measurement -
-    the candidate's skill level, derived from points) to avoid the two
-    independently-labeled scales reading as contradicting each other
-    when shown next to one another.
+    Builds the "Market demand" line for a score_breakdown row or gap -
+    how many of the retrieved postings actually cite this, from the
+    trusted citation data analyzer.py attached (never LLM-generated
+    text). Explicitly labeled "Market demand" rather than "evidence" -
+    that word doesn't overload with `status`, which is a completely
+    separate measurement (the candidate's own skill level, from
+    evidence_pct) shown right next to this.
+
+    avg_relevance (retrieval similarity score) is deliberately left out
+    of this line - it's useful for debugging retrieval quality, not for
+    a candidate deciding what to do about a gap, so it's kept in the
+    raw-data expander instead of the primary UI.
     """
     citations = item.get("citations") or []
     if not citations:
@@ -233,22 +242,27 @@ def citation_line(item: dict) -> str:
     if len(companies) > 4:
         company_str += f" +{len(companies) - 4} more"
 
-    tier_labels = {
-        "well_supported": "Well-supported",
-        "some_support": "Some support",
-        "limited_support": "Limited support",
-        "unsupported": "No citations",
-    }
-    tier = tier_labels.get(item.get("evidence_tier"), "Citation coverage")
-
     total = item.get("cited_total")
     count = item.get("cited_count", len(citations))
-    pct = item.get("coverage_pct")
+    pct = item.get("market_demand_pct")
     of_total = f" of {total}" if total else ""
     pct_str = f" ({pct}%)" if pct is not None else ""
-    avg_rel = item.get("avg_relevance")
-    rel_str = f" · avg retrieval relevance {avg_rel:.2f}" if avg_rel is not None else ""
-    return f"{tier} — {count}{of_total} retrieved postings{pct_str}{rel_str} — {company_str}"
+    return f"Market demand: {count}{of_total} postings{pct_str} — {company_str}"
+
+
+STATUS_LABELS = {
+    "strong": "Strong",
+    "good": "Good",
+    "partial": "Partial",
+    "weak": "Weak",
+    "not_demonstrated": "Not demonstrated",
+}
+
+PRIORITY_LABELS = {
+    "high": "High priority",
+    "medium": "Medium priority",
+    "low": "Low priority",
+}
 
 
 st.markdown('<div class="gc-eyebrow">CAREER DIAGNOSTIC</div>', unsafe_allow_html=True)
@@ -387,20 +401,21 @@ if submitted:
             rows = ""
             for b in result["score_breakdown"]:
                 status = b.get("status", "partial").lower()
-                if status not in ("strong", "partial", "missing"):
+                if status not in STATUS_LABELS:
                     status = "partial"
-                points_str = ""
-                if b.get("max_points") is not None and b.get("achieved_points") is not None:
-                    points_str = f" &middot; {b['achieved_points']}/{b['max_points']} pts"
-                note_html = '<div class="gc-breakdown-note">' + b.get("note", "") + points_str + '</div>'
-                cite = citation_line(b)
-                if cite:
-                    note_html += '<div class="gc-citation">' + cite + '</div>'
+                status_label = STATUS_LABELS.get(status, status)
+                evidence_str = ""
+                if b.get("evidence_pct") is not None:
+                    evidence_str = f" &middot; Candidate evidence: {status_label} ({b['evidence_pct']}%)"
+                note_html = '<div class="gc-breakdown-note">' + b.get("note", "") + evidence_str + '</div>'
+                demand_line = market_demand_line(b)
+                if demand_line:
+                    note_html += '<div class="gc-citation">' + demand_line + '</div>'
                 rows += (
                     '<div class="gc-breakdown-row">'
                     '<div><div class="gc-breakdown-area">' + b.get("area", "") + '</div>'
                     + note_html + '</div>'
-                    '<span class="gc-status-badge gc-status-' + status + '">' + status + '</span>'
+                    '<span class="gc-status-badge gc-status-' + status + '">' + status_label + '</span>'
                     '</div>'
                 )
             st.markdown('<div class="gc-score-card">' + rows + '</div>', unsafe_allow_html=True)
@@ -413,15 +428,17 @@ if submitted:
         if result.get("gaps"):
             st.markdown('<div class="gc-section-label">GAPS TO CLOSE</div>', unsafe_allow_html=True)
             for g in result["gaps"]:
-                label = g.get("skill", "Gap")
+                priority = g.get("priority", "medium")
+                priority_label = PRIORITY_LABELS.get(priority, "Medium priority")
+                label = g.get("skill", "Gap") + "  ·  " + priority_label
                 if g.get("time_estimate"):
                     label += "  ·  ~" + g["time_estimate"]
                 with st.expander(label):
                     st.write("**Why it matters:** " + g.get("why_it_matters", ""))
                     st.write("**How to fix:** " + g.get("how_to_fix", ""))
-                    cite = citation_line(g)
-                    if cite:
-                        st.markdown('<div class="gc-citation">' + cite + '</div>', unsafe_allow_html=True)
+                    demand_line = market_demand_line(g)
+                    if demand_line:
+                        st.markdown('<div class="gc-citation">' + demand_line + '</div>', unsafe_allow_html=True)
                         for c in g.get("citations", []):
                             if c.get("url"):
                                 st.markdown(

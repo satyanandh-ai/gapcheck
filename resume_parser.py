@@ -93,25 +93,38 @@ def parse_profile(raw_text: str) -> dict:
         raise RuntimeError("GROQ_API_KEY not set - add it to your .env file")
 
     client = Groq(api_key=GROQ_API_KEY)
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": PARSE_SYSTEM_PROMPT},
-            {"role": "user", "content": raw_text[:8000]},
-        ],
-        temperature=0.2,
-    )
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
 
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"[resume_parser] LLM returned non-JSON, degrading to empty profile: {e}")
+    # Same defenses as analyzer.py's Groq call - see that file's comment
+    # for why: gpt-oss-120b is a reasoning model with known cases of
+    # reasoning tokens leaking into / eating into the output budget,
+    # which can truncate JSON mid-response.
+    last_error = None
+    for attempt in range(2):
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": PARSE_SYSTEM_PROMPT},
+                {"role": "user", "content": raw_text[:8000]},
+            ],
+            temperature=0.2,
+            max_tokens=3000,
+            reasoning_effort="low",
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        try:
+            parsed = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            last_error = e
+            print(f"[resume_parser] JSON parse failed on attempt {attempt + 1}/2: {e}")
+    else:
+        print(f"[resume_parser] LLM returned non-JSON twice in a row, degrading to empty profile: {last_error}")
         return dict(EMPTY_PROFILE)
 
     # Fill in any missing keys rather than trust the LLM followed the

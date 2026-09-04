@@ -73,7 +73,9 @@ def _llm_normalize(location_key: str) -> str:
             {"role": "user", "content": location_key},
         ],
         temperature=0,
-        max_tokens=60,
+        max_tokens=150,
+        reasoning_effort="low",
+        response_format={"type": "json_object"},
     )
     return response.choices[0].message.content.strip()
 

@@ -162,22 +162,54 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
         "target_role": target_role,
         "job_postings": trimmed_postings,
     })
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0.4,
-    )
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    parsed = json.loads(raw)
-    return _resolve_citations(parsed, index_to_job)
+
+    # gpt-oss-120b is a reasoning model - Groq has open, live bug reports
+    # of its internal reasoning tokens occasionally leaking into or
+    # eating into the same output budget as the actual answer, which can
+    # truncate a long JSON response mid-string. Three defenses:
+    #   - response_format=json_object: Groq enforces syntactically valid
+    #     JSON server-side, the strongest guard against a cut-off response
+    #   - reasoning_effort="low": this task is a direct extraction/scoring
+    #     job, not something needing deep reasoning chains, so keep more
+    #     of the token budget for the actual answer
+    #   - generous max_tokens: this schema (up to 15 postings' worth of
+    #     citations, 4-6 breakdown rows, several gaps) is verbose; give
+    #     it real headroom instead of hitting a default limit
+    # Even with all three, an occasional malformed response is still
+    # possible (LLM output isn't 100% deterministic) - retry once on a
+    # JSON parse failure before giving up, since a re-sample often
+    # succeeds where the first attempt didn't.
+    last_error = None
+    for attempt in range(2):
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.4,
+            max_tokens=8000,
+            reasoning_effort="low",
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        try:
+            parsed = json.loads(raw)
+            return _resolve_citations(parsed, index_to_job)
+        except json.JSONDecodeError as e:
+            last_error = e
+            print(f"[analyzer] JSON parse failed on attempt {attempt + 1}/2: {e}")
+
+    raise RuntimeError(
+        "The analysis came back malformed twice in a row - this is usually a temporary "
+        "issue with the AI model's response, not something wrong with your search. "
+        "Please try running the gap check again."
+    ) from last_error
 
 
 def _market_demand_tier(market_demand_pct: float, cited_count: int) -> str:

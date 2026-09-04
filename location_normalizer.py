@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 NORMALIZE_SYSTEM_PROMPT = """You convert a user-typed location into a
 standardized job-search location.
@@ -66,7 +67,7 @@ def _llm_normalize(location_key: str) -> str:
 
     client = Groq(api_key=GROQ_API_KEY)
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": NORMALIZE_SYSTEM_PROMPT},
             {"role": "user", "content": location_key},

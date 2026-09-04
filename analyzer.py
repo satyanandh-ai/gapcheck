@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 from retrieval import retrieve_relevant_jobs
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Groq deprecates and shuts down models on a rolling basis (they've done
+# this roughly monthly through 2026 per their changelog) - keeping this
+# as an env var means the next deprecation is a config change, not a
+# code push. llama-3.3-70b-versatile was shut down 08/16/26; this
+# default is Groq's own recommended replacement as of that deprecation.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 def _strip_html(text):
     """Remove HTML tags and collapse whitespace from a snippet string."""
     if not text:
@@ -157,7 +163,7 @@ def analyze_gap(user_skills: str, target_role: str, job_postings: list) -> dict:
         "job_postings": trimmed_postings,
     })
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
